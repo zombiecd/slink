@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: slink-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: slink
+      POSTGRES_PASSWORD: slink
+      POSTGRES_DB: slink
+      # 性能参数：本地开发够用即可
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      - "5432:5432"
+    volumes:
+      - slink-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U slink -d slink"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "log_statement=none"
+
+  redis:
+    image: redis:7-alpine
+    container_name: slink-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - slink-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--maxmemory"
+      - "512mb"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+
+volumes:
+  slink-pg-data:
+  slink-redis-data:

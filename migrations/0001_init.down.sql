@@ -1,0 +1,5 @@
+DROP TABLE IF EXISTS click_events_2026_06;
+DROP TABLE IF EXISTS click_events_2026_05;
+DROP TABLE IF EXISTS click_events;
+DROP TABLE IF EXISTS links;
+DROP TABLE IF EXISTS id_segment;
