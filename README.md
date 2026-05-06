@@ -61,23 +61,23 @@ cp .env.example .env
 make run
 ```
 
-服务起在 `http://localhost:8080`。
+服务起在 `http://localhost:18080`。
 
 ### 创建短链
 
 ```bash
-curl -X POST http://localhost:8080/api/links \
+curl -X POST http://localhost:18080/api/links \
   -H 'Content-Type: application/json' \
   -d '{"long_url": "https://example.com/some/very/long/url"}'
 
 # 返回
-# {"code": "5BxX", "short_url": "http://localhost:8080/5BxX", "long_url": "..."}
+# {"code": "5BxX", "short_url": "http://localhost:18080/5BxX", "long_url": "..."}
 ```
 
 ### 跳转
 
 ```bash
-curl -i http://localhost:8080/5BxX
+curl -i http://localhost:18080/5BxX
 
 # HTTP/1.1 302 Found
 # Location: https://example.com/some/very/long/url

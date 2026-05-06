@@ -2,7 +2,7 @@
         run build test bench cover lint tidy clean fmt vet
 
 # 默认 PG DSN（覆盖：make migrate PG_DSN=...）
-PG_DSN ?= postgres://slink:slink@localhost:5432/slink?sslmode=disable
+PG_DSN ?= postgres://slink:slink@localhost:15432/slink?sslmode=disable
 
 help:
 	@echo "slink — common make targets"
