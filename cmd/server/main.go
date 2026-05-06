@@ -3,10 +3,11 @@
 // 职责仅限"装配"：
 //  1. 加载 config
 //  2. 建 store / cache 客户端（启动时验证依赖可达）
-//  3. 注册 HTTP 路由（健康检查 + 后续 API）
-//  4. 启动 server，监听信号优雅停机
+//  3. 建发号器（号段双 buffer + Base62 Generator）
+//  4. 注册 HTTP 路由（健康检查 + API）
+//  5. 启动 server，监听信号优雅停机
 //
-// 业务逻辑全部住在 internal/* 下，main 不写任何 if 业务分支。
+// 业务逻辑全部住在 internal/* 下，main 不写任何业务分支。
 package main
 
 import (
@@ -21,13 +22,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/zombiecd/slink/internal/api"
 	"github.com/zombiecd/slink/internal/cache"
 	"github.com/zombiecd/slink/internal/config"
+	"github.com/zombiecd/slink/internal/id"
 	"github.com/zombiecd/slink/internal/store"
 )
 
 const (
-	version       = "v0.1-day2"
+	version       = "v0.1-day4"
 	shutdownGrace = 10 * time.Second
 )
 
@@ -80,22 +83,39 @@ func run() error {
 	defer redisCli.Close()
 	slog.Info("redis connected", "addr", cfg.RedisAddr)
 
-	// ── 4. 路由 ────────────────────────────────────────────
+	// ── 4. 建发号器 ────────────────────────────────────────
+	segRepo := store.NewSegmentRepo(pgPool)
+	buf, err := id.NewDoubleBuffer(bootCtx, segRepo, cfg.IDBizTag, cfg.IDStepSize, 0.9, logger)
+	if err != nil {
+		return err
+	}
+	generator := id.NewGenerator(buf)
+	slog.Info("id generator ready",
+		"biz_tag", cfg.IDBizTag,
+		"step_size", cfg.IDStepSize)
+
+	// ── 5. 建 API server ──────────────────────────────────
+	linkRepo := store.NewLinkRepo(pgPool)
+	apiSrv := api.NewServer(api.Config{BaseURL: cfg.BaseURL}, generator, linkRepo)
+
+	// ── 6. 路由（健康检查 + API）──────────────────────────
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", livenessHandler)
 	mux.HandleFunc("/readyz", readinessHandler(pgPool, redisCli))
+	// 把 api 子路由挂到主 mux（Go 1.22+ ServeMux 嵌套）
+	mux.Handle("/api/", apiSrv.Routes())
 
-	srv := &http.Server{
+	httpSrv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	// ── 5. 启动 + 优雅停机 ─────────────────────────────────
+	// ── 7. 启动 + 优雅停机 ─────────────────────────────────
 	serveErr := make(chan error, 1)
 	go func() {
 		slog.Info("listening", "addr", cfg.Addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 		}
 		close(serveErr)
@@ -113,7 +133,7 @@ func run() error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("server shutdown", "err", err)
 	}
 	slog.Info("bye")
@@ -176,10 +196,10 @@ func readinessHandler(pg interface {
 		defer cancel()
 
 		var (
-			wg    sync.WaitGroup
-			mu    sync.Mutex
-			ok    = true
-			res   = make(map[string]string, 2)
+			wg  sync.WaitGroup
+			mu  sync.Mutex
+			ok  = true
+			res = make(map[string]string, 2)
 		)
 		check := func(name string, fn func() error) {
 			defer wg.Done()
