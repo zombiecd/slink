@@ -55,6 +55,12 @@ type Config struct {
 	CacheTTLJitter time.Duration `env:"SLINK_CACHE_TTL_JITTER" envDefault:"10m"`
 	CacheNullTTL   time.Duration `env:"SLINK_CACHE_NULL_TTL"   envDefault:"1m"`
 
+	// L1 进程内缓存（Day 8 新增）。
+	// LocalCacheSize <= 0 → 禁用 L1，回到只用 Redis 的两层架构。
+	// LocalCacheTTL  默认 1m，远短于 Redis TTL，缩小水平扩展时多实例不一致窗口。
+	LocalCacheSize int           `env:"SLINK_LOCAL_CACHE_SIZE" envDefault:"4096"`
+	LocalCacheTTL  time.Duration `env:"SLINK_LOCAL_CACHE_TTL"  envDefault:"1m"`
+
 	// ── 限流 ────────────────────────────────────────────
 	RateLimitPerIP float64 `env:"SLINK_RATE_LIMIT_PER_IP" envDefault:"100"`
 	RateLimitBurst int     `env:"SLINK_RATE_LIMIT_BURST"  envDefault:"200"`

@@ -25,10 +25,30 @@ func newTestCache(t *testing.T) (*LinkCache, *Client) {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 
-	// 测试用短 TTL
+	// 测试用短 TTL；默认不开 L1，老测试行为完全保留
 	lc := NewLinkCache(c,
 		WithTTL(2*time.Second),
 		WithMissingTTL(1*time.Second),
+	)
+	return lc, c
+}
+
+// newTestCacheWithLocal 构造带 L1 的 cache，用于 Day 8 双层语义测试。
+func newTestCacheWithLocal(t *testing.T) (*LinkCache, *Client) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c, err := NewClient(ctx, ClientConfig{Addr: addr(t)})
+	if err != nil {
+		t.Fatalf("NewClient: %v (Redis 起着吗？)", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	lc := NewLinkCache(c,
+		WithTTL(2*time.Second),
+		WithMissingTTL(1*time.Second),
+		WithLocalCache(64, time.Minute),
 	)
 	return lc, c
 }
@@ -297,6 +317,188 @@ func TestLinkCache_Invalidate(t *testing.T) {
 	_, _ = lc.GetOrLoad(ctx, code, loader)
 	if calls.Load() != 2 {
 		t.Errorf("after Invalidate: loader calls = %d, want 2", calls.Load())
+	}
+}
+
+// ─────────────────────────────────────────────────────────
+// Day 8: L1（进程内 LRU）双层语义
+// ─────────────────────────────────────────────────────────
+
+// L1 命中可以让请求完全绕过 L2（Redis）。
+// 验证方式：填好两层 → 直接外部删 Redis 的 key → 再调 GetOrLoad，
+// 仍能拿到正确结果且 loader 不再被调，证明 L1 在工作。
+func TestLinkCache_LocalHit_BypassesRedis(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	lc, c := newTestCacheWithLocal(t)
+	ctx := context.Background()
+	code := uniqueCode(t)
+	defer c.Del(ctx, linkKeyPrefix+code)
+
+	want := &model.Link{Code: code, LongURL: "https://example.com/local-hit"}
+	calls := atomic.Int32{}
+	loader := func(ctx context.Context) (*model.Link, error) {
+		calls.Add(1)
+		return want, nil
+	}
+
+	// 第一次：填 L1 + L2
+	if _, err := lc.GetOrLoad(ctx, code, loader); err != nil {
+		t.Fatalf("first GetOrLoad: %v", err)
+	}
+
+	// 直接绕过 LinkCache 删 Redis key（模拟 L2 单独失效）
+	if err := c.Del(ctx, linkKeyPrefix+code); err != nil {
+		t.Fatalf("del L2: %v", err)
+	}
+
+	// 再调：L2 已没了，但 L1 还在 → 应该命中 L1，loader 不增
+	got, err := lc.GetOrLoad(ctx, code, loader)
+	if err != nil {
+		t.Fatalf("second GetOrLoad: %v", err)
+	}
+	if got == nil || got.LongURL != want.LongURL {
+		t.Errorf("LongURL: got %v, want %q", got, want.LongURL)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("loader calls: got %d, want 1 (L1 should hit)", n)
+	}
+	if s := lc.LocalStats(); s.Hits == 0 {
+		t.Errorf("LocalStats.Hits = 0, want > 0")
+	}
+}
+
+// L1 上的 missing 标记同样能挡住 Redis。
+func TestLinkCache_LocalNegative_BypassesRedis(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	lc, c := newTestCacheWithLocal(t)
+	ctx := context.Background()
+	code := uniqueCode(t)
+	defer c.Del(ctx, linkKeyPrefix+code)
+
+	calls := atomic.Int32{}
+	loader := func(ctx context.Context) (*model.Link, error) {
+		calls.Add(1)
+		return nil, ErrLinkNotFound
+	}
+
+	// 第一次：写 missing 到 L1 + L2
+	if _, err := lc.GetOrLoad(ctx, code, loader); !errors.Is(err, ErrLinkNotFound) {
+		t.Fatalf("first: want ErrLinkNotFound, got %v", err)
+	}
+	// 删 L2
+	if err := c.Del(ctx, linkKeyPrefix+code); err != nil {
+		t.Fatalf("del L2: %v", err)
+	}
+	// 再调：L1 命中 missing
+	if _, err := lc.GetOrLoad(ctx, code, loader); !errors.Is(err, ErrLinkNotFound) {
+		t.Fatalf("second: want ErrLinkNotFound, got %v", err)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("loader calls: got %d, want 1 (L1 missing should hit)", n)
+	}
+}
+
+// Invalidate 必须同时清两层。
+func TestLinkCache_Invalidate_ClearsBothLayers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	lc, c := newTestCacheWithLocal(t)
+	ctx := context.Background()
+	code := uniqueCode(t)
+	defer c.Del(ctx, linkKeyPrefix+code)
+
+	calls := atomic.Int32{}
+	loader := func(ctx context.Context) (*model.Link, error) {
+		calls.Add(1)
+		return &model.Link{Code: code, LongURL: "https://example.com/inv"}, nil
+	}
+
+	_, _ = lc.GetOrLoad(ctx, code, loader) // 填两层
+	_, _ = lc.GetOrLoad(ctx, code, loader) // L1 命中
+	if calls.Load() != 1 {
+		t.Fatalf("setup: loader = %d, want 1", calls.Load())
+	}
+
+	if err := lc.Invalidate(ctx, code); err != nil {
+		t.Fatalf("Invalidate: %v", err)
+	}
+
+	// Invalidate 后再调：必须重新打 loader（L1 + L2 都被清）
+	_, _ = lc.GetOrLoad(ctx, code, loader)
+	if n := calls.Load(); n != 2 {
+		t.Errorf("after Invalidate: loader = %d, want 2", n)
+	}
+}
+
+// L1 禁用（size=0）时，行为应和老路径完全一致。
+func TestLinkCache_LocalDisabled_FallsBackToL2(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	ctx := context.Background()
+	c, err := NewClient(ctx, ClientConfig{Addr: addr(t)})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer c.Close()
+
+	lc := NewLinkCache(c,
+		WithTTL(2*time.Second),
+		WithLocalCache(0, 0), // 显式禁用
+	)
+	code := uniqueCode(t)
+	defer c.Del(ctx, linkKeyPrefix+code)
+
+	calls := atomic.Int32{}
+	loader := func(ctx context.Context) (*model.Link, error) {
+		calls.Add(1)
+		return &model.Link{Code: code, LongURL: "https://example.com/disabled"}, nil
+	}
+
+	_, _ = lc.GetOrLoad(ctx, code, loader)
+	_, _ = lc.GetOrLoad(ctx, code, loader) // 应命中 L2
+
+	if n := calls.Load(); n != 1 {
+		t.Errorf("loader = %d, want 1 (L2 should still cache)", n)
+	}
+	s := lc.LocalStats()
+	if s.Hits != 0 || s.Misses != 0 {
+		t.Errorf("LocalStats should be zero when L1 disabled, got %+v", s)
+	}
+}
+
+// L1 命中时不应再调 Redis（行为通过 stats 间接验证）：
+// 第一次填两层 → 计 L1 stats baseline → 再调 N 次 → L1 hits 应增加 N
+func TestLinkCache_LocalHit_StatsAccurate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	lc, c := newTestCacheWithLocal(t)
+	ctx := context.Background()
+	code := uniqueCode(t)
+	defer c.Del(ctx, linkKeyPrefix+code)
+
+	loader := func(ctx context.Context) (*model.Link, error) {
+		return &model.Link{Code: code, LongURL: "https://example.com/stats"}, nil
+	}
+
+	// 第一次填缓存
+	_, _ = lc.GetOrLoad(ctx, code, loader)
+	base := lc.LocalStats()
+
+	const N = 10
+	for i := 0; i < N; i++ {
+		_, _ = lc.GetOrLoad(ctx, code, loader)
+	}
+
+	got := lc.LocalStats()
+	if delta := got.Hits - base.Hits; delta != N {
+		t.Errorf("L1 hits delta: got %d, want %d", delta, N)
 	}
 }
 

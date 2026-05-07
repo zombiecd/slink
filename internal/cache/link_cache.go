@@ -43,6 +43,11 @@ const (
 	// TTL 抖动比例 = ±10%，防雪崩。
 	// 同时入缓存的一批 key 不会同一刻一起失效。
 	jitterPct = 0.10
+
+	// L1（进程内 LRU）默认 TTL = 1 分钟。
+	// 远短于 L2（Redis）的 10 分钟，目的是缩小水平扩展时多实例间的不一致窗口。
+	// 1 分钟够覆盖一次 wrk 30s + 拍测，又不会让管理动作（删/改）等太久才生效。
+	defaultLocalTTL = 1 * time.Minute
 )
 
 // linkCacheValue 是 Redis 里存的紧凑视图。
@@ -77,45 +82,78 @@ func valueFromLink(l *model.Link) linkCacheValue {
 // 这样 LinkCache 才能写入空值标记防穿透。
 type LinkLoader func(ctx context.Context) (*model.Link, error)
 
-// LinkCache 是短链跳转专用的 cache-aside 封装。
+// LinkCache 是短链跳转专用的两层 cache-aside 封装。
+//
+//	请求 → L1 (in-process LRU + TTL) → L2 (Redis) → loader (DB)
 //
 // 三大坑防护一站式集成：
 //
-//	缓存穿透：DB 不存在的 code 也写入 missingMarker（短 TTL）
+//	缓存穿透：DB 不存在的 code 也写入 missingMarker（短 TTL，L1/L2 都缓存）
 //	缓存击穿：用 singleflight 合并相同 code 的回源请求
-//	缓存雪崩：TTL ±jitterPct 随机抖动
+//	缓存雪崩：L2 TTL ±jitterPct 随机抖动
 //
-// 设计成 method 而不是顶层函数：因为要持有 singleflight.Group（按 code 合并）+ Redis client。
+// L1 设计取舍（Day 8）：
+//
+//	好处：mixed 场景命中率 99%+，L1 命中省一次 Redis 网络 RTT + JSON 反序列化
+//	代价：水平扩展时多实例 L1 不一致；通过 L1 TTL 短于 L2（1min vs 10min）压缩窗口
+//	可关闭：localSize<=0 → local==nil → 走老路径只用 L2
 type LinkCache struct {
 	rdb        *Client
+	local      *localCache // L1，nil 表示禁用
 	sf         singleflight.Group
 	ttl        time.Duration
 	missingTTL time.Duration
 }
 
-// LinkCacheOption 用于自定义 TTL（测试时缩短）。
-type LinkCacheOption func(*LinkCache)
+// LinkCacheOption 用于自定义 TTL（测试时缩短）+ L1 容量。
+type LinkCacheOption func(*linkCacheConfig)
+
+type linkCacheConfig struct {
+	ttl        time.Duration
+	missingTTL time.Duration
+	localSize  int
+	localTTL   time.Duration
+}
 
 func WithTTL(ttl time.Duration) LinkCacheOption {
-	return func(c *LinkCache) { c.ttl = ttl }
+	return func(c *linkCacheConfig) { c.ttl = ttl }
 }
 
 func WithMissingTTL(ttl time.Duration) LinkCacheOption {
-	return func(c *LinkCache) { c.missingTTL = ttl }
+	return func(c *linkCacheConfig) { c.missingTTL = ttl }
+}
+
+// WithLocalCache 启用进程内 L1。size<=0 等于禁用。
+func WithLocalCache(size int, ttl time.Duration) LinkCacheOption {
+	return func(c *linkCacheConfig) {
+		c.localSize = size
+		c.localTTL = ttl
+	}
 }
 
 // NewLinkCache 构造 LinkCache。
-// rdb 不能为 nil；TTL 缺省 10min / 30s。
+// rdb 不能为 nil；TTL 缺省 10min / 30s；L1 默认禁用（size=0），用 WithLocalCache 显式开。
 func NewLinkCache(rdb *Client, opts ...LinkCacheOption) *LinkCache {
-	lc := &LinkCache{
-		rdb:        rdb,
+	cfg := linkCacheConfig{
 		ttl:        defaultLinkTTL,
 		missingTTL: defaultMissingTTL,
+		localTTL:   defaultLocalTTL,
 	}
 	for _, opt := range opts {
-		opt(lc)
+		opt(&cfg)
 	}
-	return lc
+	return &LinkCache{
+		rdb:        rdb,
+		local:      newLocalCache(cfg.localSize, cfg.localTTL),
+		ttl:        cfg.ttl,
+		missingTTL: cfg.missingTTL,
+	}
+}
+
+// LocalStats 返回 L1 命中统计快照（bench/observability 用）。
+// L1 未启用时返回零值。
+func (lc *LinkCache) LocalStats() localStats {
+	return lc.local.Stats()
 }
 
 // GetOrLoad 是跳转路径的唯一入口。
@@ -144,12 +182,23 @@ func (lc *LinkCache) GetOrLoad(
 ) (*model.Link, error) {
 	key := linkKeyPrefix + code
 
+	// ── 0. 查 L1（进程内 LRU） ────────────────────────────
+	// L1 命中直返，省一次 Redis 网络 RTT + JSON 反序列化。
+	// nil cache 时 Get 永远 miss（localCache 自带 nil-safe）。
+	if e, ok := lc.local.Get(key); ok {
+		if e.link == nil {
+			return nil, ErrLinkNotFound
+		}
+		return e.link, nil
+	}
+
 	// ── 1. 查 Redis ──────────────────────────────────────
 	raw, err := lc.rdb.Get(ctx, key)
 	switch {
 	case err == nil:
 		// 命中：检查是不是空值标记
 		if raw == missingMarker {
+			lc.local.Put(key, localEntry{link: nil}) // 回填 L1 missing
 			return nil, ErrLinkNotFound
 		}
 		// 反序列化
@@ -161,14 +210,16 @@ func (lc *LinkCache) GetOrLoad(
 			_ = lc.rdb.Del(ctx, key)
 			break
 		}
-		return v.toLink(), nil
+		link := v.toLink()
+		lc.local.Put(key, localEntry{link: link}) // 回填 L1
+		return link, nil
 
 	case errors.Is(err, ErrCacheMiss):
 		// 正常 miss，往下走 loader
 
 	default:
 		// Redis 真错误（连接/超时）：缓存挂了不能拖垮跳转 → 降级直接打 DB
-		// 注意此路径下不写缓存，避免雪崩时把 DB 也打挂
+		// 注意此路径下不写缓存（L1 也不回填），避免雪崩时把 DB 也打挂
 		slog.Warn("link cache get failed, fallback to loader",
 			"code", code, "err", err)
 		return loader(ctx)
@@ -208,20 +259,32 @@ func (lc *LinkCache) GetOrLoad(
 		return link, nil
 	})
 	if err != nil {
+		// loader 真错误（非 NotFound）：不回填 L1（有重试机会）
+		if errors.Is(err, ErrLinkNotFound) {
+			lc.local.Put(key, localEntry{link: nil}) // 回填 L1 missing
+			return nil, err
+		}
 		return nil, err
 	}
 	link, ok := v.(*model.Link)
 	if !ok || link == nil {
 		// singleflight 结果是 (*model.Link)(nil) 表示 ErrLinkNotFound
+		lc.local.Put(key, localEntry{link: nil}) // 回填 L1 missing
 		return nil, ErrLinkNotFound
 	}
+	lc.local.Put(key, localEntry{link: link}) // 回填 L1
 	return link, nil
 }
 
-// Invalidate 主动失效一个 code 的缓存。
+// Invalidate 主动失效一个 code 的缓存（L1 + L2）。
 // 创建短链冲突修复 / 删除短链时调用。
+//
+// 注意：这只清当前实例的 L1。多实例部署时其他实例的 L1 还会持有旧值，
+// 直到自然 TTL 过期（默认 1min）。Day 8 的已知 trade-off。
 func (lc *LinkCache) Invalidate(ctx context.Context, code string) error {
-	return lc.rdb.Del(ctx, linkKeyPrefix+code)
+	key := linkKeyPrefix + code
+	lc.local.Del(key)
+	return lc.rdb.Del(ctx, key)
 }
 
 // Set 主动写入缓存（创建短链后预热可用）。

@@ -5,6 +5,7 @@ go 1.24.0
 require (
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/fasthttp/router v1.5.4
+	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/jackc/pgx/v5 v5.7.5
 	github.com/joho/godotenv v1.5.1
 	github.com/redis/go-redis/v9 v9.19.0

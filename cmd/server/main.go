@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version       = "v0.2-day7"
+	version       = "v0.3-day8"
 	shutdownGrace = 10 * time.Second
 
 	// 主端口允许的最大请求体（POST /api/links 仅吃几 KB JSON）。
@@ -108,7 +108,13 @@ func run() error {
 	// ── 5. 建 cache + 异步事件链路 ─────────────────────────
 	linkRepo := store.NewLinkRepo(pgPool)
 	clickRepo := store.NewClickEventRepo(pgPool)
-	linkCache := cache.NewLinkCache(redisCli) // 默认 TTL 10min / missing 30s
+	// L1（进程内 LRU）默认开 4096 entries / 1min TTL；SLINK_LOCAL_CACHE_SIZE<=0 时禁用。
+	linkCache := cache.NewLinkCache(redisCli,
+		cache.WithLocalCache(cfg.LocalCacheSize, cfg.LocalCacheTTL),
+	)
+	slog.Info("link cache ready",
+		"l1_size", cfg.LocalCacheSize,
+		"l1_ttl", cfg.LocalCacheTTL)
 
 	eventBuf := event.NewBuffer(clickRepo, event.BufferConfig{
 		Capacity:      10_000,
