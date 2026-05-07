@@ -4,8 +4,11 @@
 //  1. 加载 config
 //  2. 建 store / cache 客户端（启动时验证依赖可达）
 //  3. 建发号器（号段双 buffer + Base62 Generator）
-//  4. 注册 HTTP 路由（健康检查 + API）
+//  4. 注册 HTTP 路由（健康检查 + API + 跳转）
 //  5. 启动 server，监听信号优雅停机
+//
+// v0.2 关键变化：主端口从 net/http 切到 valyala/fasthttp，
+// 但 pprof 仍保留在 net/http :6060（外部 go tool pprof / curl 兼容）。
 //
 // 业务逻辑全部住在 internal/* 下，main 不写任何业务分支。
 package main
@@ -23,6 +26,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/valyala/fasthttp"
+
 	"github.com/zombiecd/slink/internal/api"
 	"github.com/zombiecd/slink/internal/cache"
 	"github.com/zombiecd/slink/internal/config"
@@ -32,8 +37,12 @@ import (
 )
 
 const (
-	version       = "v0.1-day5"
+	version       = "v0.2-day7"
 	shutdownGrace = 10 * time.Second
+
+	// 主端口允许的最大请求体（POST /api/links 仅吃几 KB JSON）。
+	// 远小于 fasthttp 默认 4MB，给 SSRF / DoS body 保险。
+	maxRequestBodySize = 16 * 1024 // 16 KB
 )
 
 func main() {
@@ -110,40 +119,42 @@ func run() error {
 	slog.Info("event buffer started",
 		"capacity", 10_000, "batch_size", 1000, "flush_interval", "1s")
 
-	// ── 6. 建 API server ──────────────────────────────────
+	// ── 6. 建 API server + 路由（健康检查 + API + 跳转）─────
+	//
+	// fasthttp/router：静态路由（/healthz / /readyz）优先级高于参数路由（/{code}），
+	// 不会被跳转处理器误吞。
 	apiSrv := api.NewServer(
 		api.Config{BaseURL: cfg.BaseURL},
 		generator, linkRepo, linkCache, eventBuf,
 	)
+	r := apiSrv.Routes()
+	r.GET("/healthz", livenessHandler)
+	r.GET("/readyz", readinessHandler(pgPool, redisCli))
 
-	// ── 7. 路由（健康检查 + API + 跳转）─────────────────
+	// ── 6.5 fasthttp 主 server ────────────────────────────
 	//
-	// 路由结构：
-	//   /healthz / /readyz  → 精确匹配，外层 mux 处理
-	//   /api/...            → 走 apiSrv.Routes() 内部匹配（POST /api/links 等）
-	//   /:code              → 走 apiSrv.Routes() 内部匹配（跳转）
-	//
-	// Go 1.22 ServeMux 优先级：精确匹配 > 通配前缀。
-	// 所以 "/" 兜底在 mux 里**不会**抢走 /healthz —— 它走专属精确路由。
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", livenessHandler)
-	mux.HandleFunc("/readyz", readinessHandler(pgPool, redisCli))
-	// "/" 兜底：所有未被精确匹配的路径都进 apiSrv（含 /api/* 和 /:code）
-	mux.Handle("/", apiSrv.Routes())
-
-	httpSrv := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
+	// 关键参数：
+	//   Name              暴露给 Server 响应头，便于运维识别版本
+	//   MaxRequestBodySize 16KB 远小于默认 4MB，防 DoS
+	//   ReadTimeout/WriteTimeout 10s 防慢速攻击
+	//   IdleTimeout 60s    keep-alive 复用上限
+	httpSrv := &fasthttp.Server{
+		Handler:            r.Handler,
+		Name:               "slink/" + version,
+		MaxRequestBodySize: maxRequestBodySize,
+		ReadTimeout:        10 * time.Second,
+		WriteTimeout:       10 * time.Second,
+		IdleTimeout:        60 * time.Second,
 	}
 
-	// ── 6.5 pprof 单独端口（仅本机访问）─────────────────────
+	// ── 6.6 pprof 单独端口（仍用 net/http，外部工具兼容）────
 	//
-	// 为什么单独端口而不是挂在主端口：
-	//   1. pprof 暴露 goroutine / heap / cpu profile，外部访问 = 信息泄漏
-	//   2. 业务端口加 /debug/pprof 路由污染，影响路由表性能
-	//   3. 单独 server 自带独立 mux（http.DefaultServeMux），改动面小
-	// 业界标准（Kubernetes / Prometheus / Etcd 都这么做）。
+	// 为什么不迁 fasthttp：
+	//   1. net/http/pprof 是标准库，go tool pprof / curl / 浏览器都直接认它
+	//   2. fasthttpadaptor.NewFastHTTPHandler(http.DefaultServeMux) 能跑，
+	//      但徒增一层 net/http ↔ fasthttp 适配开销，pprof 又不在 hot path
+	//   3. pprof 端口本来就是低频访问 + 仅本机绑定，性能不重要
+	// 业界标准（Kubernetes / Prometheus / Etcd 都把 pprof 单独绑）。
 	if cfg.PProfAddr != "" {
 		pprofSrv := &http.Server{
 			Addr:              cfg.PProfAddr,
@@ -151,7 +162,7 @@ func run() error {
 			ReadHeaderTimeout: 5 * time.Second,
 		}
 		go func() {
-			slog.Info("pprof listening", "addr", cfg.PProfAddr)
+			slog.Info("pprof listening (net/http)", "addr", cfg.PProfAddr)
 			if err := pprofSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				slog.Error("pprof server", "err", err)
 			}
@@ -166,8 +177,8 @@ func run() error {
 	// ── 7. 启动 + 优雅停机 ─────────────────────────────────
 	serveErr := make(chan error, 1)
 	go func() {
-		slog.Info("listening", "addr", cfg.Addr)
-		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		slog.Info("listening (fasthttp)", "addr", cfg.Addr)
+		if err := httpSrv.ListenAndServe(cfg.Addr); err != nil {
 			serveErr <- err
 		}
 		close(serveErr)
@@ -186,12 +197,12 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
 
-	// 优雅停机顺序很重要：
-	//   1. HTTP server Shutdown：停接新连接 + 等已有请求完成
+	// 优雅停机顺序：
+	//   1. fasthttp.Server ShutdownWithContext：停接新连接 + 等已有请求完成
 	//   2. EventBuffer Stop：drain channel + 最后一次 flush
 	//   3. defer 链关闭 redisCli / pgPool（在 run() 顶部 defer）
 	// 反过来：先关 PG → buffer flush 时无 sink → 残余事件丢失
-	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+	if err := httpSrv.ShutdownWithContext(shutdownCtx); err != nil {
 		slog.Error("http server shutdown", "err", err)
 	}
 	if err := eventBuf.Stop(shutdownCtx); err != nil {
@@ -240,9 +251,9 @@ type readyResp struct {
 	Backends map[string]string `json:"backends"`
 }
 
-func livenessHandler(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{
+func livenessHandler(ctx *fasthttp.RequestCtx) {
+	ctx.Response.Header.Set("Content-Type", "application/json")
+	_ = json.NewEncoder(ctx).Encode(map[string]string{
 		"status":  "ok",
 		"version": version,
 	})
@@ -252,9 +263,9 @@ func livenessHandler(w http.ResponseWriter, _ *http.Request) {
 // 全部成功才返回 200，任何一个失败返回 503。
 func readinessHandler(pg interface {
 	Ping(context.Context) error
-}, rd *cache.Client) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+}, rd *cache.Client) fasthttp.RequestHandler {
+	return func(ctx *fasthttp.RequestCtx) {
+		probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
 
 		var (
@@ -278,15 +289,15 @@ func readinessHandler(pg interface {
 		}
 
 		wg.Add(2)
-		go check("postgres", func() error { return pg.Ping(ctx) })
-		go check("redis", func() error { return rd.Ping(ctx) })
+		go check("postgres", func() error { return pg.Ping(probeCtx) })
+		go check("redis", func() error { return rd.Ping(probeCtx) })
 		wg.Wait()
 
-		w.Header().Set("Content-Type", "application/json")
+		ctx.Response.Header.Set("Content-Type", "application/json")
 		if !ok {
-			w.WriteHeader(http.StatusServiceUnavailable)
+			ctx.SetStatusCode(http.StatusServiceUnavailable)
 		}
-		_ = json.NewEncoder(w).Encode(readyResp{
+		_ = json.NewEncoder(ctx).Encode(readyResp{
 			Status:   statusFor(ok),
 			Version:  version,
 			Backends: res,

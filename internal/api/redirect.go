@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/valyala/fasthttp"
+
 	"github.com/zombiecd/slink/internal/cache"
 	"github.com/zombiecd/slink/internal/event"
 	"github.com/zombiecd/slink/internal/model"
@@ -21,16 +23,22 @@ import (
 // Base62(int64.MaxValue) ≈ 11 字符，留 16 给未来扩展（含 "+ ID 前缀混淆"）。
 const codeMaxLen = 16
 
-// handleRedirect 处理 GET /:code。
+// handleRedirect 处理 GET /{code}。
 //
 // 主路径 SLA：< 5ms（命中 Redis 时）→ 简历"扛 10w QPS"故事的源头。
+//
+// fasthttp 迁移要点（vs Day 6 net/http 版）：
+//   - path param 通过 ctx.UserValue("code").(string) 读取，
+//     fasthttp/router 已经把 path slice 复制成 string，可直接用
+//   - http.Redirect → ctx.Response.Header.Set("Location") + ctx.SetStatusCode(302)
+//   - 使用 ctx 作为 context.Context 直接传给 cache（fasthttp.RequestCtx 实现了 context.Context）
 //
 // 流程：
 //
 //	1. 提取并校验 code（长度 / 字符集留给 cache 层）
 //	2. cache.GetOrLoad（内含三大坑防护）
 //	3. 校验过期（ExpiresAt）
-//	4. http.Redirect(302) ◀── 用户立即跳走
+//	4. 302 + Location ◀── 用户立即跳走
 //	5. 异步 Enqueue ClickEvent（不阻塞已发出的响应）
 //
 // 响应码选择：
@@ -41,36 +49,36 @@ const codeMaxLen = 16
 //
 // 不用 301 Moved Permanently：浏览器/CDN 会缓存 301，事件采集会断。
 // 详见 docs/concepts/redirect-302-vs-301.md
-func (s *Server) handleRedirect(w http.ResponseWriter, r *http.Request) {
-	code := strings.TrimPrefix(r.URL.Path, "/")
+func (s *Server) handleRedirect(ctx *fasthttp.RequestCtx) {
+	code, _ := ctx.UserValue("code").(string)
 
 	// 边界：空 code 或包含路径分隔符（典型探测：/api/foo, /../etc/passwd）
-	// ServeMux 实际不会把这种路由进来，但兜底防御
+	// router 实际不会把这种路由进来，但兜底防御
 	if code == "" || strings.ContainsAny(code, "/?#") {
-		writeError(w, http.StatusNotFound, ErrNotFound, "code is empty or invalid")
+		writeError(ctx, http.StatusNotFound, ErrNotFound, "code is empty or invalid")
 		return
 	}
 	if len(code) > codeMaxLen {
-		writeError(w, http.StatusNotFound, ErrNotFound, "code too long")
+		writeError(ctx, http.StatusNotFound, ErrNotFound, "code too long")
 		return
 	}
 
 	// 查缓存（cache miss 自动回源 DB）
-	link, err := s.linkCache.GetOrLoad(r.Context(), code, s.dbLoader(code))
+	link, err := s.linkCache.GetOrLoad(ctx, code, s.dbLoader(code))
 	if err != nil {
 		if errors.Is(err, cache.ErrLinkNotFound) {
-			writeError(w, http.StatusNotFound, ErrNotFound, "no such link")
+			writeError(ctx, http.StatusNotFound, ErrNotFound, "no such link")
 			return
 		}
-		// 客户端断开（context canceled / deadline exceeded）：
-		// 这不是 server 错误，是用户提前关闭连接。压测下高频出现，
-		// 不该刷 ERROR 日志（百万次会淹没真错误）。响应也写不出去了。
+		// 客户端断开：fasthttp 默认不 cancel per-request context，
+		// 但底层 Redis client 可能因自身超时返回 context.DeadlineExceeded。
+		// 同 Day 6 处理：不刷 ERROR 日志。
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return
 		}
 		// 真错误：DB 抖动 / Redis 抖动
 		slog.Error("redirect lookup failed", "code", code, "err", err)
-		writeError(w, http.StatusInternalServerError, ErrInternal, "lookup failed")
+		writeError(ctx, http.StatusInternalServerError, ErrInternal, "lookup failed")
 		return
 	}
 
@@ -78,22 +86,20 @@ func (s *Server) handleRedirect(w http.ResponseWriter, r *http.Request) {
 	if link.IsExpired(time.Now()) {
 		// 过期短链返回 410 Gone（不是 404）
 		// 客户端能区分"从来没有"vs"曾经有过但过期了"
-		writeError(w, http.StatusGone, ErrNotFound, "link expired")
+		writeError(ctx, http.StatusGone, ErrNotFound, "link expired")
 		return
 	}
 
 	// 重定向 → 用户立即跳走
 	//
-	// 手写替代 http.Redirect(w, r, url, 302)：
-	//   标准库会写一段 HTML body（"<a href=...>Found</a>"）+ 设置 Content-Type，
-	//   并对 url 做 escapeHTML。302 的 body 浏览器根本不展示——纯浪费。
-	//   profile 显示 http.Redirect cum alloc 占 21% 总分配。
-	//   手写：仅写 Location header + 302 status code → 一个写头一个写状态。
-	w.Header().Set("Location", link.LongURL)
-	w.WriteHeader(http.StatusFound)
+	// 手写替代 http.Redirect（与 Day 6 同思路）：
+	//   只写 Location header + 302 status code，body 留空。
+	//   fasthttp 不会自带 HTML body，比 net/http 还省一笔。
+	ctx.Response.Header.Set("Location", link.LongURL)
+	ctx.SetStatusCode(http.StatusFound)
 
 	// 异步事件投递（**响应已发完**，这里出错也不影响用户）
-	s.enqueueClickEvent(r, code)
+	s.enqueueClickEvent(ctx, code)
 }
 
 // dbLoader 返回一个 LinkLoader，把 store.ErrLinkNotFound 翻译成 cache.ErrLinkNotFound。
@@ -117,11 +123,15 @@ func (s *Server) dbLoader(code string) cache.LinkLoader {
 // 在 redirect 之后调用：响应已写出，这里阻塞也只阻塞当前 goroutine
 // 的"清理时间"，不影响用户体验。但 Eventer 实现自己应该是非阻塞的。
 //
-// 不传 r.Context()：跳转响应已发完，请求 context 即将被 cancel。
-// 也不创建 context.WithTimeout —— Buffer.Enqueue 默认是 select-default
-// 非阻塞路径，根本不读 ctx。每次请求 new timer + cancel 是纯浪费。
-// （profile 显示 context.WithDeadlineCause 占 5.5% 总分配）
-func (s *Server) enqueueClickEvent(r *http.Request, code string) {
+// fasthttp 零拷贝注意：
+//   - ctx.Request.Header.UserAgent() / Referer() 返回的 []byte 仅在 handler 期间有效，
+//     async 入队前必须 string() 拷贝（Go string 不可变 → 安全持有）
+//   - clientIP 返回 net.IP 已是新拷贝
+//   - code 由 router 解析为 string，已是拷贝
+//
+// 不创建 context.WithTimeout —— Buffer.Enqueue 默认 select-default 非阻塞，不读 ctx。
+// 同 Day 6 优化：避免 context.WithDeadlineCause 的 timer alloc。
+func (s *Server) enqueueClickEvent(ctx *fasthttp.RequestCtx, code string) {
 	if s.events == nil {
 		return
 	}
@@ -129,9 +139,9 @@ func (s *Server) enqueueClickEvent(r *http.Request, code string) {
 	evt := event.ClickEvent{
 		EventID:   newEventID(),
 		Code:      code,
-		IP:        clientIP(r),
-		UserAgent: r.UserAgent(),
-		Referer:   r.Referer(),
+		IP:        clientIP(ctx),
+		UserAgent: string(ctx.Request.Header.UserAgent()),
+		Referer:   string(ctx.Request.Header.Referer()),
 		TS:        time.Now().UTC(),
 	}
 
@@ -145,24 +155,27 @@ func (s *Server) enqueueClickEvent(r *http.Request, code string) {
 //
 // 注意：生产部署在 LB 后面时 X-Forwarded-For 才可信。
 // v0.1 简化处理；v0.3 加 trusted proxy 列表。
-func clientIP(r *http.Request) net.IP {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+//
+// fasthttp Header.Peek 返回 zero-copy []byte（仅 handler 期间有效），
+// net.ParseIP 会做拷贝，结果安全。
+func clientIP(ctx *fasthttp.RequestCtx) net.IP {
+	if xff := ctx.Request.Header.Peek("X-Forwarded-For"); len(xff) > 0 {
 		// XFF 可能是 "client, proxy1, proxy2"，取第一个
-		first := strings.TrimSpace(strings.SplitN(xff, ",", 2)[0])
+		first := strings.TrimSpace(strings.SplitN(string(xff), ",", 2)[0])
 		if ip := net.ParseIP(first); ip != nil {
 			return ip
 		}
 	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		if ip := net.ParseIP(strings.TrimSpace(xri)); ip != nil {
+	if xri := ctx.Request.Header.Peek("X-Real-IP"); len(xri) > 0 {
+		if ip := net.ParseIP(strings.TrimSpace(string(xri))); ip != nil {
 			return ip
 		}
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
+	// fasthttp 已解析好 RemoteAddr，net.Addr 接口
+	if tcpAddr, ok := ctx.RemoteAddr().(*net.TCPAddr); ok {
+		return tcpAddr.IP
 	}
-	return net.ParseIP(host)
+	return nil
 }
 
 // hexChars 是 hex 编码查找表（小写），用于 newEventID 的零分配格式化。
@@ -182,37 +195,28 @@ const hexChars = "0123456789abcdef"
 // 输出形如：xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx（y ∈ {8,9,a,b}）
 // PG 列 event_id UUID 直接接受这种字符串。
 func newEventID() string {
-	// 用 2 个 uint64（16 字节）作为随机源，避开 crypto/rand 的 syscall
 	hi := rand.Uint64()
 	lo := rand.Uint64()
 
-	// 按 RFC 4122 v4 设置标记位：
-	//   字节 6 高 4 位 = 0x40（version 4）
-	//   字节 8 高 2 位 = 0x80（variant 10xx）
-	// hi 的字节 0..7：[0..7]，字节 6 在 hi 中是 (hi >> 8) & 0xff
-	// lo 的字节 8..15：[8..15]，字节 8 在 lo 中是 (lo >> 56) & 0xff
 	hi = (hi & 0xffff_ffff_ffff_0fff) | 0x0000_0000_0000_4000 // version 4
 	lo = (lo & 0x3fff_ffff_ffff_ffff) | 0x8000_0000_0000_0000 // variant 10xx
 
-	// 36 字节：32 hex + 4 dash
 	var buf [36]byte
-	// 写 hex 的小工具（in-place）
 	writeHex := func(off int, n uint64, nibbles int) {
 		for i := nibbles - 1; i >= 0; i-- {
 			buf[off+i] = hexChars[n&0xf]
 			n >>= 4
 		}
 	}
-	// 8-4-4-4-12 = 32 hex + 4 dash
-	writeHex(0, hi>>32, 8)        // 8 hex from hi[0..3]
+	writeHex(0, hi>>32, 8)
 	buf[8] = '-'
-	writeHex(9, (hi>>16)&0xffff, 4) // 4 hex from hi[4..5]
+	writeHex(9, (hi>>16)&0xffff, 4)
 	buf[13] = '-'
-	writeHex(14, hi&0xffff, 4)    // 4 hex from hi[6..7]
+	writeHex(14, hi&0xffff, 4)
 	buf[18] = '-'
-	writeHex(19, lo>>48, 4)       // 4 hex from lo[0..1]
+	writeHex(19, lo>>48, 4)
 	buf[23] = '-'
-	writeHex(24, lo&0xffff_ffff_ffff, 12) // 12 hex from lo[2..7]
+	writeHex(24, lo&0xffff_ffff_ffff, 12)
 
 	return string(buf[:])
 }

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,28 +14,28 @@ import (
 	"github.com/zombiecd/slink/internal/model"
 )
 
-// 工具：发起 GET /:code 请求（不跟随重定向）
-func (h *harness) get(t *testing.T, code string) *httptest.ResponseRecorder {
+// 工具：发起 GET /:code 请求（不跟随重定向 — 由 client.CheckRedirect 负责）
+func (h *harness) get(t *testing.T, code string) *httpResp {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, "/"+code, nil)
-	rec := httptest.NewRecorder()
-	h.srv.Routes().ServeHTTP(rec, req)
-	return rec
+	req, err := http.NewRequest(http.MethodGet, h.addr+"/"+code, nil)
+	if err != nil {
+		t.Fatalf("new req: %v", err)
+	}
+	return h.do(t, req)
 }
 
 // 工具：先创建一条短链，返回 code
 func (h *harness) createLink(t *testing.T, longURL string) string {
 	t.Helper()
 	body, _ := json.Marshal(model.CreateLinkRequest{LongURL: longURL})
-	req := httptest.NewRequest(http.MethodPost, "/api/links", bytes.NewReader(body))
+	req, _ := http.NewRequest(http.MethodPost, h.addr+"/api/links", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	h.srv.Routes().ServeHTTP(rec, req)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("create link: %d %s", rec.Code, rec.Body.String())
+	rec := h.do(t, req)
+	if rec.StatusCode != http.StatusCreated {
+		t.Fatalf("create link: %d %s", rec.StatusCode, rec.BodyString())
 	}
 	var resp model.CreateLinkResponse
-	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	_ = json.Unmarshal(rec.Body, &resp)
 	return resp.Code
 }
 
@@ -51,10 +50,10 @@ func TestRedirect_Success(t *testing.T) {
 
 	rec := h.get(t, code)
 
-	if rec.Code != http.StatusFound {
-		t.Fatalf("status: got %d, want 302", rec.Code)
+	if rec.StatusCode != http.StatusFound {
+		t.Fatalf("status: got %d, want 302", rec.StatusCode)
 	}
-	if loc := rec.Header().Get("Location"); loc != longURL {
+	if loc := rec.Header.Get("Location"); loc != longURL {
 		t.Errorf("Location: got %q, want %q", loc, longURL)
 	}
 }
@@ -70,8 +69,8 @@ func TestRedirect_CacheHitsAfterFirstMiss(t *testing.T) {
 
 	// 第一次：cache miss → DB 回源 → 写 cache
 	rec1 := h.get(t, code)
-	if rec1.Code != http.StatusFound {
-		t.Fatalf("first: got %d", rec1.Code)
+	if rec1.StatusCode != http.StatusFound {
+		t.Fatalf("first: got %d", rec1.StatusCode)
 	}
 
 	// 直接看 Redis：现在应该有 link:{code}（不是 missingMarker）
@@ -87,10 +86,10 @@ func TestRedirect_CacheHitsAfterFirstMiss(t *testing.T) {
 
 	// 第二次：直接命中
 	rec2 := h.get(t, code)
-	if rec2.Code != http.StatusFound {
-		t.Fatalf("second: got %d", rec2.Code)
+	if rec2.StatusCode != http.StatusFound {
+		t.Fatalf("second: got %d", rec2.StatusCode)
 	}
-	if rec2.Header().Get("Location") != longURL {
+	if rec2.Header.Get("Location") != longURL {
 		t.Errorf("second Location wrong")
 	}
 }
@@ -104,8 +103,8 @@ func TestRedirect_NotFound_WritesMissingMarker(t *testing.T) {
 	code := "Z9zZ9z" // 不存在
 
 	rec := h.get(t, code)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status: got %d, want 404", rec.Code)
+	if rec.StatusCode != http.StatusNotFound {
+		t.Fatalf("status: got %d, want 404", rec.StatusCode)
 	}
 
 	// 验证 Redis 里写了空值标记
@@ -143,8 +142,8 @@ func TestRedirect_Expired_410(t *testing.T) {
 	_ = h.linkCache.Invalidate(ctx, code)
 
 	rec := h.get(t, code)
-	if rec.Code != http.StatusGone {
-		t.Fatalf("status: got %d, want 410", rec.Code)
+	if rec.StatusCode != http.StatusGone {
+		t.Fatalf("status: got %d, want 410", rec.StatusCode)
 	}
 }
 
@@ -157,8 +156,8 @@ func TestRedirect_TooLongCode(t *testing.T) {
 	// 17 字节，超过 codeMaxLen = 16
 	longCode := "abcdefghijklmnopq"
 	rec := h.get(t, longCode)
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("got %d, want 404 for long code", rec.Code)
+	if rec.StatusCode != http.StatusNotFound {
+		t.Errorf("got %d, want 404 for long code", rec.StatusCode)
 	}
 }
 
@@ -189,11 +188,15 @@ func TestRedirect_EnqueuesClickEvent(t *testing.T) {
 
 	code := h.createLink(t, "https://example.com/event-test")
 	resp := h.get(t, code)
-	if resp.Code != http.StatusFound {
-		t.Fatalf("status: %d", resp.Code)
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("status: %d", resp.StatusCode)
 	}
 
-	// 异步投递理论上是同步入 channel，立即可见
+	// enqueueClickEvent 在 handler 同步段调用（响应已写出后），
+	// 但 fasthttp handler 返回前必然已执行完毕，立即可见。
+	// 给 5ms 给 handler 完整返回（in-memory 通常 < 1ms，保险起见）。
+	time.Sleep(5 * time.Millisecond)
+
 	if got := rec.count.Load(); got != 1 {
 		t.Errorf("Enqueue calls: got %d, want 1", got)
 	}
@@ -218,14 +221,12 @@ func TestRedirect_EnqueuesClickEvent(t *testing.T) {
 
 func TestRouting_APIPrefixNotShadowedByCodeRoute(t *testing.T) {
 	h := setupHarness(t)
-	// GET /api/links 不存在，应当返回 405 Method Not Allowed（POST 才接），
-	// 而不是被 GET /{code} 当作 code="api" 处理
-	req := httptest.NewRequest(http.MethodGet, "/api/links", nil)
-	rec := httptest.NewRecorder()
-	h.srv.Routes().ServeHTTP(rec, req)
+	// GET /api/links 不存在（POST 才接），fasthttp/router 对未注册的 method 返回 405
+	req, _ := http.NewRequest(http.MethodGet, h.addr+"/api/links", nil)
+	rec := h.do(t, req)
 
-	// Go 1.22 ServeMux 对已注册的 path 但未注册的 method 返回 405
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Errorf("/api/links GET: got %d, want 405", rec.Code)
+	// fasthttp/router 对 path 已注册但 method 未注册返回 405
+	if rec.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("/api/links GET: got %d, want 405", rec.StatusCode)
 	}
 }

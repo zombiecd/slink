@@ -1,8 +1,9 @@
 package api
 
 import (
-	"net/http"
 	"strings"
+
+	"github.com/fasthttp/router"
 
 	"github.com/zombiecd/slink/internal/cache"
 	"github.com/zombiecd/slink/internal/event"
@@ -12,11 +13,14 @@ import (
 
 // Server 是 slink HTTP 接口层的依赖容器 + 路由装配点。
 //
-// 由 main.go 在启动期构造一次：
+// v0.2 起接口层底层改用 valyala/fasthttp + fasthttp/router：
 //
 //	srv := api.NewServer(api.Config{...}, generator, linkRepo, linkCache, eventer)
-//	mux := srv.Routes()
-//	http.Server{Handler: mux}
+//	r   := srv.Routes()
+//	server := &fasthttp.Server{Handler: r.Handler}
+//
+// 切换原因见 docs/bench/day-07-fasthttp.md（Day 6 profile 显示 net/http 标准库
+// 单进程在 21k RPS 处被 syscall + netpoll 框死，要破必须换底）。
 type Server struct {
 	cfg       Config
 	generator *id.Generator
@@ -54,21 +58,21 @@ func NewServer(
 	}
 }
 
-// Routes 返回包含所有 HTTP 路由的 mux。
+// Routes 返回 fasthttp 路由器。
 //
 // 路由表：
 //
 //	POST /api/links          创建短链（Day 4）
-//	GET  /api/links/{code}   v0.5+，读元数据（暂不实现）
 //	GET  /{code}             跳转（Day 5）
 //
-// Go 1.22+ ServeMux 支持 method matching，单 mux 即可。
+// fasthttp/router 用 /{name} 语法（与 Go 1.22+ ServeMux 同），
+// 通过 ctx.UserValue("code").(string) 取路径参数。
 //
-// 注意路由优先级：ServeMux 规则越具体优先级越高，
-// "/api/" 前缀比 "/{code}" 更具体，所以 /api/* 不会被 /{code} 匹配走。
-func (s *Server) Routes() *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/links", s.handleCreateLink)
-	mux.HandleFunc("GET /{code}", s.handleRedirect)
-	return mux
+// 路由优先级：静态路径（/api/links）优先于带参数路径（/{code}），
+// 所以 /api/* 不会被 /{code} 误吞。
+func (s *Server) Routes() *router.Router {
+	r := router.New()
+	r.POST("/api/links", s.handleCreateLink)
+	r.GET("/{code}", s.handleRedirect)
+	return r
 }

@@ -5,8 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -14,6 +15,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/valyala/fasthttp"
+	"github.com/valyala/fasthttp/fasthttputil"
 
 	"github.com/zombiecd/slink/internal/cache"
 	"github.com/zombiecd/slink/internal/event"
@@ -24,6 +27,12 @@ import (
 
 // 集成 e2e 测试：启 Server 跑真 SQL，需要 docker compose up + migrate。
 // 单元层（参数校验、JSON 解析）不需要 PG，单独测。
+//
+// v0.2 起底层切到 fasthttp，测试改用 fasthttputil.InmemoryListener：
+//   - 启一个 fasthttp.Server 监听内存 listener
+//   - http.Client 的 Transport.DialContext 走这个 listener.Dial
+//   - 标准 http.Request/Response 的 assertion 全部保留
+// 好处：业务断言一行不用改，只换"运输层"。
 
 // ────────────────────────────────────────────────────────────
 // e2e 测试基础设施
@@ -34,6 +43,10 @@ type harness struct {
 	srv       *Server
 	linkCache *cache.LinkCache
 	rdb       *cache.Client
+	client    *http.Client     // 走 in-memory fasthttp server
+	addr      string           // 仅用于拼 URL，dial 实际走 listener
+	fhSrv     *fasthttp.Server // 持有引用便于 Cleanup 时关闭
+	listener  *fasthttputil.InmemoryListener
 }
 
 func setupHarness(t *testing.T) *harness {
@@ -90,27 +103,98 @@ func setupHarness(t *testing.T) *harness {
 		Config{BaseURL: "http://test.local"},
 		gen, links, linkCache, event.NopEventer{},
 	)
+
+	// fasthttp server + 内存 listener
+	ln := fasthttputil.NewInmemoryListener()
+	fhSrv := &fasthttp.Server{
+		Handler:            srv.Routes().Handler,
+		MaxRequestBodySize: 16 * 1024,
+	}
+	go func() {
+		_ = fhSrv.Serve(ln)
+	}()
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return ln.Dial()
+			},
+		},
+		// 不跟随 302（跳转测试要看 Location header / 状态码）
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: 5 * time.Second,
+	}
+
 	t.Cleanup(func() {
 		bg := context.Background()
 		var endMax int64
 		_ = pool.QueryRow(bg, "SELECT max_id FROM id_segment WHERE biz_tag = $1", bizTag).Scan(&endMax)
 		_, _ = pool.Exec(bg, "DELETE FROM links WHERE id > $1 AND id <= $2", startMax, endMax)
+		_ = fhSrv.Shutdown()
+		_ = ln.Close()
 		_ = rdb.Close()
 		pool.Close()
 	})
-	return &harness{pool: pool, srv: srv, linkCache: linkCache, rdb: rdb}
+	return &harness{
+		pool:      pool,
+		srv:       srv,
+		linkCache: linkCache,
+		rdb:       rdb,
+		client:    httpClient,
+		addr:      "http://test.local",
+		fhSrv:     fhSrv,
+		listener:  ln,
+	}
 }
 
-func (h *harness) post(t *testing.T, body string, headers map[string]string) *httptest.ResponseRecorder {
+// httpResp 是简化的响应快照，便于 assertion（不持 net.Conn / Body 句柄）。
+type httpResp struct {
+	StatusCode int
+	Header     http.Header
+	Body       []byte
+}
+
+func (r *httpResp) BodyString() string { return string(r.Body) }
+
+func (h *harness) do(t *testing.T, req *http.Request) *httpResp {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/api/links", bytes.NewBufferString(body))
+	resp, err := h.client.Do(req)
+	if err != nil {
+		t.Fatalf("http do: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return &httpResp{
+		StatusCode: resp.StatusCode,
+		Header:     resp.Header,
+		Body:       body,
+	}
+}
+
+func (h *harness) post(t *testing.T, body string, headers map[string]string) *httpResp {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, h.addr+"/api/links", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("new req: %v", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	rec := httptest.NewRecorder()
-	h.srv.Routes().ServeHTTP(rec, req)
-	return rec
+	return h.do(t, req)
+}
+
+// rawPost 走原始 io.Reader（用于发非 JSON 等场景）。预留，目前 post 已够用。
+func (h *harness) rawPost(t *testing.T, body io.Reader) *httpResp {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, h.addr+"/api/links", body)
+	req.Header.Set("Content-Type", "application/json")
+	return h.do(t, req)
 }
 
 // ────────────────────────────────────────────────────────────
@@ -121,11 +205,11 @@ func TestCreate_Success(t *testing.T) {
 	h := setupHarness(t)
 	rec := h.post(t, `{"long_url":"https://example.com/foo"}`, nil)
 
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("status: got %d, want 201; body=%s", rec.Code, rec.Body.String())
+	if rec.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201; body=%s", rec.StatusCode, rec.BodyString())
 	}
 	var resp model.CreateLinkResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := json.Unmarshal(rec.Body, &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if len(resp.Code) != 6 {
@@ -145,16 +229,16 @@ func TestCreate_Success(t *testing.T) {
 func TestCreate_BadJSON(t *testing.T) {
 	h := setupHarness(t)
 	rec := h.post(t, `not json`, nil)
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("status: got %d, want 400", rec.Code)
+	if rec.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", rec.StatusCode)
 	}
 }
 
 func TestCreate_UnknownField(t *testing.T) {
 	h := setupHarness(t)
 	rec := h.post(t, `{"long_url":"https://x.com","unknown":1}`, nil)
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("DisallowUnknownFields should reject: got %d", rec.Code)
+	if rec.StatusCode != http.StatusBadRequest {
+		t.Errorf("DisallowUnknownFields should reject: got %d", rec.StatusCode)
 	}
 }
 
@@ -169,8 +253,8 @@ func TestCreate_InvalidURL(t *testing.T) {
 	for _, body := range cases {
 		t.Run(body, func(t *testing.T) {
 			rec := h.post(t, body, nil)
-			if rec.Code != http.StatusBadRequest {
-				t.Errorf("got %d, want 400 for %s", rec.Code, body)
+			if rec.StatusCode != http.StatusBadRequest {
+				t.Errorf("got %d, want 400 for %s", rec.StatusCode, body)
 			}
 		})
 	}
@@ -183,19 +267,19 @@ func TestCreate_IdempotencyHit(t *testing.T) {
 
 	// 第一次：201 Created
 	rec1 := h.post(t, body, map[string]string{"Idempotency-Key": idem})
-	if rec1.Code != http.StatusCreated {
-		t.Fatalf("first: got %d, want 201; body=%s", rec1.Code, rec1.Body.String())
+	if rec1.StatusCode != http.StatusCreated {
+		t.Fatalf("first: got %d, want 201; body=%s", rec1.StatusCode, rec1.BodyString())
 	}
 	var resp1 model.CreateLinkResponse
-	_ = json.Unmarshal(rec1.Body.Bytes(), &resp1)
+	_ = json.Unmarshal(rec1.Body, &resp1)
 
 	// 第二次同 key：200 OK + 同 code
 	rec2 := h.post(t, body, map[string]string{"Idempotency-Key": idem})
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("second: got %d, want 200; body=%s", rec2.Code, rec2.Body.String())
+	if rec2.StatusCode != http.StatusOK {
+		t.Fatalf("second: got %d, want 200; body=%s", rec2.StatusCode, rec2.BodyString())
 	}
 	var resp2 model.CreateLinkResponse
-	_ = json.Unmarshal(rec2.Body.Bytes(), &resp2)
+	_ = json.Unmarshal(rec2.Body, &resp2)
 
 	if resp1.Code != resp2.Code {
 		t.Errorf("idem replay: code differs: %q vs %q", resp1.Code, resp2.Code)
@@ -217,9 +301,9 @@ func TestCreate_IdempotencyConcurrentRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			rec := h.post(t, body, map[string]string{"Idempotency-Key": idem})
-			statuses[i] = rec.Code
+			statuses[i] = rec.StatusCode
 			var r model.CreateLinkResponse
-			_ = json.Unmarshal(rec.Body.Bytes(), &r)
+			_ = json.Unmarshal(rec.Body, &r)
 			codes[i] = r.Code
 		}()
 	}
@@ -248,3 +332,6 @@ func TestErrorTypes_Exposed(t *testing.T) {
 		t.Fatal("sanity")
 	}
 }
+
+// 兼容性断言：harness 没用上的 helper 也保留构造，供后续测试扩展。
+var _ = bytes.NewReader
