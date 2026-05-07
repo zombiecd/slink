@@ -11,19 +11,45 @@
 
 ### 🔬 我想深挖某个知识点
 直接进 [concepts/](concepts/)。每篇按"5 分钟讲透"标尺写：
+
+**基础设施**
 - [go-project-layout.md](concepts/go-project-layout.md) — Go 项目目录约定
 - [docker-compose-engineering.md](concepts/docker-compose-engineering.md) — Docker Compose 工程实践
 - [postgres-partitioning.md](concepts/postgres-partitioning.md) — PG 分区表
+- [pgx-connection-pool.md](concepts/pgx-connection-pool.md) — pgx 连接池
+- [12-factor-config.md](concepts/12-factor-config.md) — 12-factor 配置
+- [k8s-health-checks.md](concepts/k8s-health-checks.md) — K8s 健康检查
+
+**短码生成 / API**
 - [id-segment-schema.md](concepts/id-segment-schema.md) — 号段表设计
+- [leaf-segment-double-buffer.md](concepts/leaf-segment-double-buffer.md) — 美团 Leaf 双 buffer
+- [base62-encoding.md](concepts/base62-encoding.md) — Base62 编码
+- [idempotency-key.md](concepts/idempotency-key.md) — 幂等键设计
+- [url-validation-ssrf.md](concepts/url-validation-ssrf.md) — URL 校验 + SSRF 防御
+
+**跳转 / 缓存 / 异步事件（Day 5）**
+- [cache-aside-three-pitfalls.md](concepts/cache-aside-three-pitfalls.md) — 缓存穿透/击穿/雪崩三大坑
+- [redirect-302-vs-301.md](concepts/redirect-302-vs-301.md) — 短链跳转状态码取舍
+- [async-event-channel.md](concepts/async-event-channel.md) — channel buffer + COPY FROM 异步事件链路
+
+### 📊 我想看性能基线
+[bench/](bench/) — 压测报告。
+- [day-05-baseline.md](bench/day-05-baseline.md) — 跳转性能探底（21k RPS / P99 6.84ms）
 
 ### 📅 我想看作者每天踩了什么坑
 [journal/](journal/) 按天记录：
 - [day-01.md](journal/day-01.md) — 项目骨架与基础设施
+- [day-02.md](journal/day-02.md) — 配置 + 存储 + 缓存
+- [day-03.md](journal/day-03.md) — 号段双 buffer + Base62
+- [day-04.md](journal/day-04.md) — 创建短链 API + 幂等 + SSRF
+- [day-05.md](journal/day-05.md) — 跳转 + 缓存三大坑 + 异步事件 + 压测探底
 
 ### ⚖️ 我想审计架构决策
 [adr/](adr/) — 架构决策记录（Architecture Decision Records）。每个决策一份永久档案，即便后来被推翻也保留。
 - [0001-postgres-as-primary-store.md](adr/0001-postgres-as-primary-store.md)
 - [0002-id-segment-not-snowflake.md](adr/0002-id-segment-not-snowflake.md)
+- [0003-config-library.md](adr/0003-config-library.md)
+- [0004-code-position-shuffle.md](adr/0004-code-position-shuffle.md)
 
 ---
 
@@ -35,6 +61,7 @@ docs/
 ├── journal/          ← 实战日志（时间序）
 ├── architecture/     ← 架构总览（每个版本一篇）
 ├── concepts/         ← 知识点深度讲解（主题序，可被任何文档反向引用）
+├── bench/            ← 压测基线 + 调优记录（按 day-N 命名）
 └── adr/              ← 架构决策记录（编号永久不变）
 ```
 
