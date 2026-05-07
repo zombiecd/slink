@@ -50,27 +50,18 @@ type Config struct {
 	IDStepSize int64  `env:"SLINK_ID_STEP_SIZE" envDefault:"1000"`
 	IDBizTag   string `env:"SLINK_ID_BIZ_TAG"   envDefault:"link"`
 
-	// ── 缓存策略 ────────────────────────────────────────
-	CacheTTL       time.Duration `env:"SLINK_CACHE_TTL"        envDefault:"24h"`
-	CacheTTLJitter time.Duration `env:"SLINK_CACHE_TTL_JITTER" envDefault:"10m"`
-	CacheNullTTL   time.Duration `env:"SLINK_CACHE_NULL_TTL"   envDefault:"1m"`
-
-	// L1 进程内缓存（Day 8 新增）。
+	// ── L1 进程内缓存（Day 8）─────────────────────────────
 	// LocalCacheSize <= 0 → 禁用 L1，回到只用 Redis 的两层架构。
 	// LocalCacheTTL  默认 1m，远短于 Redis TTL，缩小水平扩展时多实例不一致窗口。
 	LocalCacheSize int           `env:"SLINK_LOCAL_CACHE_SIZE" envDefault:"4096"`
 	LocalCacheTTL  time.Duration `env:"SLINK_LOCAL_CACHE_TTL"  envDefault:"1m"`
 
-	// 异步事件 buffer 配置（Day 9 调优）。
+	// ── 异步事件 buffer（Day 9 调优）─────────────────────
 	// Day 8 实测 93k RPS 把 10k/1k/1s 的默认值打爆（63% 丢）。
 	// 调到 50k/2k/500ms 后 dropped 趋零，内存约 5MB（5w × 100B/event）。
 	EventBufferCapacity      int           `env:"SLINK_EVENT_BUFFER_CAPACITY"       envDefault:"50000"`
 	EventBufferBatchSize     int           `env:"SLINK_EVENT_BUFFER_BATCH_SIZE"     envDefault:"2000"`
 	EventBufferFlushInterval time.Duration `env:"SLINK_EVENT_BUFFER_FLUSH_INTERVAL" envDefault:"500ms"`
-
-	// ── 限流 ────────────────────────────────────────────
-	RateLimitPerIP float64 `env:"SLINK_RATE_LIMIT_PER_IP" envDefault:"100"`
-	RateLimitBurst int     `env:"SLINK_RATE_LIMIT_BURST"  envDefault:"200"`
 }
 
 // Load 读取配置，按优先级合并：环境变量 > .env > 默认值。
@@ -121,17 +112,8 @@ func (c *Config) Validate() error {
 	if c.IDStepSize <= 0 {
 		return errors.New("ID_STEP_SIZE must be > 0")
 	}
-	if c.CacheTTLJitter > c.CacheTTL {
-		return fmt.Errorf("CACHE_TTL_JITTER (%s) cannot exceed CACHE_TTL (%s)", c.CacheTTLJitter, c.CacheTTL)
-	}
 	if _, err := url.Parse(c.BaseURL); err != nil {
 		return fmt.Errorf("BASE_URL is not a valid URL: %w", err)
-	}
-	if c.RateLimitPerIP <= 0 {
-		return errors.New("RATE_LIMIT_PER_IP must be > 0")
-	}
-	if c.RateLimitBurst <= 0 {
-		return errors.New("RATE_LIMIT_BURST must be > 0")
 	}
 	if c.EventBufferCapacity <= 0 {
 		return errors.New("EVENT_BUFFER_CAPACITY must be > 0")

@@ -15,14 +15,12 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
 	_ "net/http/pprof" // 注册 /debug/pprof/* 路由到 http.DefaultServeMux
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -157,8 +155,8 @@ func run() error {
 		generator, linkRepo, linkCache, eventBuf,
 	)
 	r := apiSrv.Routes()
-	r.GET("/healthz", livenessHandler)
-	r.GET("/readyz", readinessHandler(pgPool, redisCli))
+	r.GET("/healthz", api.Liveness(version))
+	r.GET("/readyz", api.Readiness(version, pgPool, redisCli))
 
 	// ── 6.5 fasthttp 主 server ────────────────────────────
 	//
@@ -191,7 +189,7 @@ func run() error {
 	// /debug/stats（Day 9 新增）也挂这个 admin 端口：
 	//   admin 数据不应跟生产流量同端口，避免被外网拉到 → 沿用 pprof 的本地绑定模型。
 	if cfg.PProfAddr != "" {
-		http.HandleFunc("/debug/stats", statsHandler(linkCache, eventBuf, generator, time.Now()))
+		http.HandleFunc("/debug/stats", api.Stats(version, linkCache, eventBuf, generator, time.Now()))
 		// Day 10: Prometheus /metrics 挂同一个 admin 端口
 		http.Handle("/metrics", promhttp.HandlerFor(metricsReg.Registry, promhttp.HandlerOpts{
 			EnableOpenMetrics: true,
@@ -274,143 +272,3 @@ func newLogger(cfg *config.Config) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(os.Stdout, opts))
 }
 
-// ──────────────────────────────────────────────────────────
-//                       健康检查
-// ──────────────────────────────────────────────────────────
-//
-// /healthz —— Kubernetes liveness probe
-//   只返回 "进程是否还活着"。绝不依赖外部组件。
-//   用途：Pod 卡死时 K8s 会重启它。
-//
-// /readyz  —— Kubernetes readiness probe
-//   返回 "服务是否准备好接流量"，依赖检查 PG + Redis。
-//   用途：依赖暂时不可达时 LB 把这个 Pod 摘掉，但 Pod 不重启。
-
-type readyResp struct {
-	Status   string            `json:"status"`
-	Version  string            `json:"version"`
-	Backends map[string]string `json:"backends"`
-}
-
-func livenessHandler(ctx *fasthttp.RequestCtx) {
-	ctx.Response.Header.Set("Content-Type", "application/json")
-	_ = json.NewEncoder(ctx).Encode(map[string]string{
-		"status":  "ok",
-		"version": version,
-	})
-}
-
-// readinessHandler 并行 ping 所有依赖。
-// 全部成功才返回 200，任何一个失败返回 503。
-func readinessHandler(pg interface {
-	Ping(context.Context) error
-}, rd *cache.Client) fasthttp.RequestHandler {
-	return func(ctx *fasthttp.RequestCtx) {
-		probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		defer cancel()
-
-		var (
-			wg  sync.WaitGroup
-			mu  sync.Mutex
-			ok  = true
-			res = make(map[string]string, 2)
-		)
-		check := func(name string, fn func() error) {
-			defer wg.Done()
-			if err := fn(); err != nil {
-				mu.Lock()
-				ok = false
-				res[name] = "fail: " + err.Error()
-				mu.Unlock()
-				return
-			}
-			mu.Lock()
-			res[name] = "ok"
-			mu.Unlock()
-		}
-
-		wg.Add(2)
-		go check("postgres", func() error { return pg.Ping(probeCtx) })
-		go check("redis", func() error { return rd.Ping(probeCtx) })
-		wg.Wait()
-
-		ctx.Response.Header.Set("Content-Type", "application/json")
-		if !ok {
-			ctx.SetStatusCode(http.StatusServiceUnavailable)
-		}
-		_ = json.NewEncoder(ctx).Encode(readyResp{
-			Status:   statusFor(ok),
-			Version:  version,
-			Backends: res,
-		})
-	}
-}
-
-func statusFor(ok bool) string {
-	if ok {
-		return "ok"
-	}
-	return "degraded"
-}
-
-// ──────────────────────────────────────────────────────────
-//                       /debug/stats（Day 9）
-// ──────────────────────────────────────────────────────────
-//
-// 一站式观测：L1 命中率 + event buffer 状态 + ID 号段进度 + uptime。
-// 仅挂 admin 端口（默认 127.0.0.1:6060），不暴露给外网。
-//
-// 用途：
-//  1. bench 后核对 L1 hit rate（不再靠"profile 间接估"）
-//  2. 监控 event buffer Used/Capacity，提前预警 dropped
-//  3. 简历讲故事时有现成数字（"L1 命中 99.7% / dropped 0 / uptime 2 小时"）
-
-type localCacheStatsView struct {
-	Hits    uint64  `json:"hits"`
-	Misses  uint64  `json:"misses"`
-	HitRate float64 `json:"hit_rate"` // 计算字段，便于一眼看出
-}
-
-type linkCacheStats struct {
-	L1 localCacheStatsView `json:"l1"`
-}
-
-type statsResp struct {
-	Version       string          `json:"version"`
-	UptimeSeconds int64           `json:"uptime_seconds"`
-	LinkCache     linkCacheStats  `json:"link_cache"`
-	EventBuffer   event.Stats     `json:"event_buffer"`
-	IDGenerator   id.BufferStat   `json:"id_generator"`
-}
-
-func statsHandler(
-	lc *cache.LinkCache,
-	eb *event.Buffer,
-	gen *id.Generator,
-	startTime time.Time,
-) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		l1 := lc.LocalStats()
-		hitRate := 0.0
-		if total := l1.Hits + l1.Misses; total > 0 {
-			hitRate = float64(l1.Hits) / float64(total)
-		}
-
-		resp := statsResp{
-			Version:       version,
-			UptimeSeconds: int64(time.Since(startTime).Seconds()),
-			LinkCache: linkCacheStats{
-				L1: localCacheStatsView{
-					Hits:    l1.Hits,
-					Misses:  l1.Misses,
-					HitRate: hitRate,
-				},
-			},
-			EventBuffer: eb.Stats(),
-			IDGenerator: gen.Stat(),
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
-	}
-}
