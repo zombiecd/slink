@@ -4,7 +4,8 @@
 /dist/
 /slink
 /server
-slink-*
+# 仅忽略仓库根的 slink-* 二进制 / 包；不要写 slink-*（会误伤子目录如 configs/grafana/dashboards/slink-overview.json）
+/slink-*
 
 # Go 测试 / 覆盖率
 *.test
