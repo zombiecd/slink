@@ -1,5 +1,6 @@
 .PHONY: help up down logs ps migrate migrate-down psql redis-cli \
-        run build test bench cover lint tidy clean fmt vet
+        run build test bench cover lint tidy clean fmt vet \
+        kafka-cli kafka-topics kafka-bootstrap
 
 # 默认 PG DSN（覆盖：make migrate PG_DSN=...）
 PG_DSN ?= postgres://slink:slink@localhost:15432/slink?sslmode=disable
@@ -7,14 +8,17 @@ PG_DSN ?= postgres://slink:slink@localhost:15432/slink?sslmode=disable
 help:
 	@echo "slink — common make targets"
 	@echo ""
-	@echo "  up          启动 docker-compose（PG + Redis）"
-	@echo "  down        停止 docker-compose"
-	@echo "  logs        跟随 docker-compose 日志"
-	@echo "  ps          查看依赖容器状态"
-	@echo "  migrate     执行 PG migrations"
-	@echo "  migrate-down 回滚最新一次 migration"
-	@echo "  psql        进入 PG shell"
-	@echo "  redis-cli   进入 Redis shell"
+	@echo "  up               启动 docker-compose（PG + Redis + Prom + Grafana + Kafka）"
+	@echo "  down             停止 docker-compose"
+	@echo "  logs             跟随 docker-compose 日志"
+	@echo "  ps               查看依赖容器状态"
+	@echo "  migrate          执行 PG migrations"
+	@echo "  migrate-down     回滚最新一次 migration"
+	@echo "  psql             进入 PG shell"
+	@echo "  redis-cli        进入 Redis shell"
+	@echo "  kafka-cli        进入 kafka 容器 shell"
+	@echo "  kafka-topics     列出所有 topic"
+	@echo "  kafka-bootstrap  创建 slink.click_events topic (4 partitions)"
 	@echo ""
 	@echo "  run         本地启动 slink 服务"
 	@echo "  build       编译 binary 到 ./bin/slink"
@@ -60,6 +64,27 @@ psql:
 
 redis-cli:
 	docker compose exec redis redis-cli
+
+# ── Kafka ──────────────────────────────────────────────
+kafka-cli:
+	docker compose exec kafka bash
+
+kafka-topics:
+	docker compose exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+
+# 创建 v0.4 click_events topic（4 partitions，retention 7d，按架构稿 §4）
+# 幂等：已存在则跳过（--if-not-exists）
+kafka-bootstrap:
+	@echo "→ Creating slink.click_events topic (4 partitions, retention 7d)"
+	docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+		--bootstrap-server localhost:9092 \
+		--create --if-not-exists \
+		--topic slink.click_events \
+		--partitions 4 \
+		--replication-factor 1 \
+		--config retention.ms=604800000
+	@echo "✓ topic ready"
+	@$(MAKE) kafka-topics
 
 # ── Go ─────────────────────────────────────────────────
 run:

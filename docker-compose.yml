@@ -103,8 +103,72 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── Day 13: Kafka (KRaft 单节点) + kafka-ui ──────────────────
+  # 决策依据：docs/architecture/v0.4-kafka.md §3 (Kafka 削峰 click_event)
+  # 镜像：apache/kafka 官方（bitnami 免费 tag 在 2025-08 后下线）
+  # KRaft 模式：单容器既当 controller 又当 broker，省 zookeeper 一节点
+  # 双 listener：INTERNAL 给容器互通 (kafka:9092)；EXTERNAL 给 host (localhost:19092)
+  kafka:
+    image: apache/kafka:3.9.2
+    container_name: slink-kafka
+    restart: unless-stopped
+    ports:
+      # 主机端口偏移，避开默认 9092
+      - "19092:19092"
+    environment:
+      # KRaft 单节点：controller + broker 同进程
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "controller,broker"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: "INTERNAL://:9092,EXTERNAL://:19092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:19092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      # 单节点开发：副本因子 1 / min.insync 1（生产必须 ≥3 / ≥2）
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_NUM_PARTITIONS: "4"
+      # 自动建 topic 关掉，强制走 make kafka-bootstrap 显式建（避免 producer 误打 topic）
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # 落盘到挂载卷（默认 /tmp/kraft-combined-logs 重启会丢）
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      # 固定 cluster id（首次 format 用；不固定则每次启动自动生成）
+      CLUSTER_ID: "slink-kraft-cluster-001"
+    volumes:
+      - slink-kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: slink-kafka-ui
+    restart: unless-stopped
+    ports:
+      # 主机端口偏移，避开默认 8080
+      - "18080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: slink
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:8080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   slink-pg-data:
   slink-redis-data:
   slink-prometheus-data:
   slink-grafana-data:
+  slink-kafka-data:
