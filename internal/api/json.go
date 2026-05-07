@@ -28,13 +28,14 @@ type ErrorResponse struct {
 
 // 业界惯例 error code（slink 用到的）。
 const (
-	ErrInvalidJSON      = "invalid_json"
-	ErrInvalidURL       = "invalid_url"
-	ErrURLTooLong       = "url_too_long"
-	ErrCodeGeneration   = "code_generation_failed"
-	ErrInternal         = "internal_error"
-	ErrNotFound         = "not_found"
-	ErrMethodNotAllowed = "method_not_allowed"
+	ErrInvalidJSON       = "invalid_json"
+	ErrInvalidURL        = "invalid_url"
+	ErrURLTooLong        = "url_too_long"
+	ErrCodeGeneration    = "code_generation_failed"
+	ErrInternal          = "internal_error"
+	ErrNotFound          = "not_found"
+	ErrMethodNotAllowed  = "method_not_allowed"
+	ErrIdemKeyTooLong    = "idem_key_too_long"
 )
 
 // writeJSON 用 status 写出 v 的 JSON 表示。

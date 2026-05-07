@@ -48,6 +48,12 @@ const (
 	// 远短于 L2（Redis）的 10 分钟，目的是缩小水平扩展时多实例间的不一致窗口。
 	// 1 分钟够覆盖一次 wrk 30s + 拍测，又不会让管理动作（删/改）等太久才生效。
 	defaultLocalTTL = 1 * time.Minute
+
+	// 默认回源超时 = 5 秒。
+	// singleflight 闭包不再绑 caller ctx（v0.3 修 H1）后，
+	// 需要一个独立超时防止 DB 卡死时无限堆积 leader goroutine。
+	// PG SELECT by PK 通常 <10ms，5s 是非常宽松的兜底。
+	defaultLoaderTimeout = 5 * time.Second
 )
 
 // linkCacheValue 是 Redis 里存的紧凑视图。
@@ -103,16 +109,25 @@ type LinkCache struct {
 	sf         singleflight.Group
 	ttl        time.Duration
 	missingTTL time.Duration
+
+	// loaderCtx 是 singleflight 闭包内打 DB / 写缓存用的 ctx。
+	// 不能复用 caller ctx —— 第一个 caller cancel 会污染所有 waiter 的结果（v0.3 H1）。
+	// 默认 context.Background()；server 生命周期 ctx 可通过 WithBackgroundContext 注入。
+	loaderCtx context.Context
+	// loaderTimeout 是单次回源的超时上限。0 = 不加超时（不推荐）。
+	loaderTimeout time.Duration
 }
 
 // LinkCacheOption 用于自定义 TTL（测试时缩短）+ L1 容量。
 type LinkCacheOption func(*linkCacheConfig)
 
 type linkCacheConfig struct {
-	ttl        time.Duration
-	missingTTL time.Duration
-	localSize  int
-	localTTL   time.Duration
+	ttl           time.Duration
+	missingTTL    time.Duration
+	localSize     int
+	localTTL      time.Duration
+	loaderCtx     context.Context
+	loaderTimeout time.Duration
 }
 
 func WithTTL(ttl time.Duration) LinkCacheOption {
@@ -131,22 +146,43 @@ func WithLocalCache(size int, ttl time.Duration) LinkCacheOption {
 	}
 }
 
+// WithBackgroundContext 注入 server 生命周期 ctx，让 singleflight leader 在
+// server shutdown 时能跟随 cancel；不传则用 context.Background()。
+//
+// 关键不变量：这个 ctx **不能** 来自任何具体 HTTP caller，否则 H1 bug 复现。
+func WithBackgroundContext(ctx context.Context) LinkCacheOption {
+	return func(c *linkCacheConfig) { c.loaderCtx = ctx }
+}
+
+// WithLoaderTimeout 给单次 singleflight 回源加超时上限（默认 5s）。
+// 闭包不再绑 caller ctx 后必须有这个兜底，避免 DB 卡死时 leader goroutine 无限堆积。
+func WithLoaderTimeout(d time.Duration) LinkCacheOption {
+	return func(c *linkCacheConfig) { c.loaderTimeout = d }
+}
+
 // NewLinkCache 构造 LinkCache。
 // rdb 不能为 nil；TTL 缺省 10min / 30s；L1 默认禁用（size=0），用 WithLocalCache 显式开。
 func NewLinkCache(rdb *Client, opts ...LinkCacheOption) *LinkCache {
 	cfg := linkCacheConfig{
-		ttl:        defaultLinkTTL,
-		missingTTL: defaultMissingTTL,
-		localTTL:   defaultLocalTTL,
+		ttl:           defaultLinkTTL,
+		missingTTL:    defaultMissingTTL,
+		localTTL:      defaultLocalTTL,
+		loaderCtx:     context.Background(),
+		loaderTimeout: defaultLoaderTimeout,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	if cfg.loaderCtx == nil {
+		cfg.loaderCtx = context.Background()
+	}
 	return &LinkCache{
-		rdb:        rdb,
-		local:      newLocalCache(cfg.localSize, cfg.localTTL),
-		ttl:        cfg.ttl,
-		missingTTL: cfg.missingTTL,
+		rdb:           rdb,
+		local:         newLocalCache(cfg.localSize, cfg.localTTL),
+		ttl:           cfg.ttl,
+		missingTTL:    cfg.missingTTL,
+		loaderCtx:     cfg.loaderCtx,
+		loaderTimeout: cfg.loaderTimeout,
 	}
 }
 
@@ -227,9 +263,21 @@ func (lc *LinkCache) GetOrLoad(
 
 	// ── 2. singleflight 合并并发回源（防击穿） ────────────
 	// 同一 code 同一时刻并发 N 个请求，只有 1 个真打 DB，其他等结果
+	//
+	// v0.3 H1 修：闭包内 **不再** 用 caller 的 ctx。
+	// 理由：第一个 caller 取消 → DB 调用 / 写缓存全部 ctx.Canceled →
+	// 所有 N 个 waiter 拿到 Canceled 错误 → 缓存没填上 → 下一波同 key 打爆 DB。
+	// 改成"server-lifetime ctx + 独立超时"后，leader 跑到底，结果落缓存。
 	v, err, _ := lc.sf.Do(key, func() (any, error) {
+		bgCtx := lc.loaderCtx
+		if lc.loaderTimeout > 0 {
+			var cancel context.CancelFunc
+			bgCtx, cancel = context.WithTimeout(bgCtx, lc.loaderTimeout)
+			defer cancel()
+		}
+
 		// double-check：可能在排队期间另一个 goroutine 已经填好缓存
-		if raw, gerr := lc.rdb.Get(ctx, key); gerr == nil {
+		if raw, gerr := lc.rdb.Get(bgCtx, key); gerr == nil {
 			if raw == missingMarker {
 				return (*model.Link)(nil), ErrLinkNotFound
 			}
@@ -239,11 +287,11 @@ func (lc *LinkCache) GetOrLoad(
 			}
 		}
 
-		link, lerr := loader(ctx)
+		link, lerr := loader(bgCtx)
 		if lerr != nil {
 			// DB 说不存在 → 写空值标记防穿透
 			if errors.Is(lerr, ErrLinkNotFound) {
-				if serr := lc.setMissing(ctx, key); serr != nil {
+				if serr := lc.setMissing(bgCtx, key); serr != nil {
 					slog.Warn("set missing marker failed", "code", code, "err", serr)
 				}
 				return (*model.Link)(nil), ErrLinkNotFound
@@ -253,7 +301,7 @@ func (lc *LinkCache) GetOrLoad(
 		}
 
 		// DB 命中 → 写正值缓存（带抖动 TTL）
-		if serr := lc.setLink(ctx, key, link); serr != nil {
+		if serr := lc.setLink(bgCtx, key, link); serr != nil {
 			slog.Warn("set link cache failed", "code", code, "err", serr)
 		}
 		return link, nil

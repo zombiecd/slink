@@ -42,7 +42,11 @@ func NewPool(ctx context.Context, c PoolConfig) (*pgxpool.Pool, error) {
 
 	pgxCfg, err := pgxpool.ParseConfig(c.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("parse DSN: %w", err)
+		// v0.3 H3: pgx ParseConfig 错误可能回灌完整 DSN（含明文密码）。
+		// 这里 **故意不用 %w** —— 一旦上层 errors.Unwrap 就会拿到带密码的原 err。
+		// 字符串脱敏后再格式化，链路上谁也拿不到秘密。
+		return nil, fmt.Errorf("parse DSN %s: %s",
+			RedactDSN(c.DSN), redactSecrets(err.Error(), c.DSN))
 	}
 
 	pgxCfg.MaxConns = c.MaxConns
@@ -54,13 +58,14 @@ func NewPool(ctx context.Context, c PoolConfig) (*pgxpool.Pool, error) {
 
 	pool, err := pgxpool.NewWithConfig(ctx, pgxCfg)
 	if err != nil {
-		return nil, fmt.Errorf("create pool: %w", err)
+		// 网络/配置错误，pgx 通常不回灌 DSN，但给一道防御纵深。
+		return nil, fmt.Errorf("create pool: %s", redactSecrets(err.Error(), c.DSN))
 	}
 
 	// 确认首次连接可用。失败则关池后返回错误。
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("ping pg: %w", err)
+		return nil, fmt.Errorf("ping pg: %s", redactSecrets(err.Error(), c.DSN))
 	}
 
 	return pool, nil

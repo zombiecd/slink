@@ -43,6 +43,16 @@ const (
 	// 主端口允许的最大请求体（POST /api/links 仅吃几 KB JSON）。
 	// 远小于 fasthttp 默认 4MB，给 SSRF / DoS body 保险。
 	maxRequestBodySize = 16 * 1024 // 16 KB
+
+	// fasthttp DoS 防护三件套（v0.3 hardening）：
+	//   ReadTimeout/WriteTimeout 已限单请求时长，
+	//   但单 IP 仍可开任意多 keep-alive 连接慢慢吐数据，
+	//   或单连接复用打到默认 Concurrency=256k。
+	// 这三个上限把"单 IP 滥用"和"全局并发"都封顶。
+	// 值偏保守：当短链 RPS 已破 8w，单 IP 1k/连接和 16k 全局并发都远高于业务上限。
+	maxConnsPerIP      = 1000
+	maxRequestsPerConn = 10000
+	maxConcurrency     = 16384
 )
 
 func main() {
@@ -151,7 +161,10 @@ func run() error {
 	// fasthttp/router：静态路由（/healthz / /readyz）优先级高于参数路由（/{code}），
 	// 不会被跳转处理器误吞。
 	apiSrv := api.NewServer(
-		api.Config{BaseURL: cfg.BaseURL},
+		api.Config{
+			BaseURL:        cfg.BaseURL,
+			TrustedProxies: cfg.TrustedProxies,
+		},
 		generator, linkRepo, linkCache, eventBuf,
 	)
 	r := apiSrv.Routes()
@@ -165,6 +178,8 @@ func run() error {
 	//   MaxRequestBodySize 16KB 远小于默认 4MB，防 DoS
 	//   ReadTimeout/WriteTimeout 10s 防慢速攻击
 	//   IdleTimeout 60s    keep-alive 复用上限
+	//   MaxConnsPerIP / MaxRequestsPerConn / Concurrency
+	//                      v0.3 hardening：封单 IP 连接数 + 单连接复用 + 全局并发
 	// Day 10: 包一层 Prometheus middleware（counter + histogram）
 	rootHandler := metricsReg.FastHTTPMiddleware(r.Handler)
 
@@ -175,6 +190,9 @@ func run() error {
 		ReadTimeout:        10 * time.Second,
 		WriteTimeout:       10 * time.Second,
 		IdleTimeout:        60 * time.Second,
+		MaxConnsPerIP:      maxConnsPerIP,
+		MaxRequestsPerConn: maxRequestsPerConn,
+		Concurrency:        maxConcurrency,
 	}
 
 	// ── 6.6 pprof + admin 单独端口（仍用 net/http，外部工具兼容）────

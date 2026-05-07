@@ -237,6 +237,69 @@ func TestLinkCache_BreakdownProtection_Singleflight(t *testing.T) {
 	}
 }
 
+// 回归：第一个 caller 取消 ctx 不应该污染 singleflight leader 的结果，
+// 缓存仍应该被填好（H1 修复，v0.3 hardening）。
+//
+// 触发条件：caller A 进入 sf 闭包 → loader 启动 → A 的 ctx 被取消。
+// bug 行为：loader 用 A 的 ctx，被 cancel；缓存写不进去；其他 waiter 拿到 Canceled。
+// 修复后：loader 用 lc.loaderCtx，跑到底；缓存填好。
+func TestLinkCache_CallerCancel_DoesNotPoisonCache(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	lc, c := newTestCache(t)
+	code := uniqueCode(t)
+	bg := context.Background()
+	defer c.Del(bg, linkKeyPrefix+code)
+
+	want := &model.Link{Code: code, LongURL: "https://example.com/cancel-poison"}
+
+	calls := atomic.Int32{}
+	started := make(chan struct{})
+	loader := func(ctx context.Context) (*model.Link, error) {
+		calls.Add(1)
+		close(started)
+		// 模拟 DB 慢查；如果实现把 caller ctx 传进来，cancel 一来就会提早出
+		select {
+		case <-time.After(200 * time.Millisecond):
+			return want, nil
+		case <-ctx.Done():
+			// H1 bug 路径：loader 拿到了 caller 的取消信号
+			return nil, ctx.Err()
+		}
+	}
+
+	// Caller A：进 sf 后立刻取消
+	callerCtx, cancel := context.WithCancel(bg)
+	doneA := make(chan struct{})
+	go func() {
+		defer close(doneA)
+		_, _ = lc.GetOrLoad(callerCtx, code, loader)
+	}()
+
+	<-started
+	cancel()
+	<-doneA
+
+	// loader 应该跑完一次（200ms 后返回 want，不被 caller cancel 干扰）
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("loader calls = %d, want 1", n)
+	}
+
+	// 关键断言：缓存应该被填好；新 caller 应该 cache hit
+	callsBefore := calls.Load()
+	got, err := lc.GetOrLoad(bg, code, loader)
+	if err != nil {
+		t.Fatalf("post-cancel GetOrLoad: %v", err)
+	}
+	if got == nil || got.LongURL != want.LongURL {
+		t.Fatalf("cache not populated: got %v want LongURL=%q", got, want.LongURL)
+	}
+	if delta := calls.Load() - callsBefore; delta != 0 {
+		t.Errorf("expected cache hit, but loader called %d more times", delta)
+	}
+}
+
 // ─────────────────────────────────────────────────────────
 // 雪崩防护：jitter 落在 [ttl-10%, ttl+10%) 区间
 // ─────────────────────────────────────────────────────────

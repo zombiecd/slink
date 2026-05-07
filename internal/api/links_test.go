@@ -322,6 +322,28 @@ func TestCreate_IdempotencyConcurrentRace(t *testing.T) {
 	t.Logf("race: %d concurrent requests, all code=%q, statuses=%v", n, first, statuses)
 }
 
+func TestCreate_IdemKeyTooLong(t *testing.T) {
+	h := setupHarness(t)
+	// 129 字节，刚刚超过 MaxIdempotencyKeyLen=128
+	tooLong := strings.Repeat("a", MaxIdempotencyKeyLen+1)
+	body := `{"long_url":"https://example.com/idemlong"}`
+
+	rec := h.post(t, body, map[string]string{"Idempotency-Key": tooLong})
+	if rec.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status: got %d, want 400; body=%s", rec.StatusCode, rec.BodyString())
+	}
+	if !strings.Contains(rec.BodyString(), ErrIdemKeyTooLong) {
+		t.Errorf("error code missing: %s", rec.BodyString())
+	}
+
+	// 边界值：恰好 128 字节应该通过（不命中 400 长度分支）
+	exact := strings.Repeat("b", MaxIdempotencyKeyLen)
+	rec2 := h.post(t, body, map[string]string{"Idempotency-Key": exact})
+	if rec2.StatusCode != http.StatusCreated && rec2.StatusCode != http.StatusOK {
+		t.Errorf("exact-length key should pass length check, got status %d", rec2.StatusCode)
+	}
+}
+
 // ────────────────────────────────────────────────────────────
 // 单元测试（不依赖 PG）
 // ────────────────────────────────────────────────────────────

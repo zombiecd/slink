@@ -11,7 +11,11 @@ package config
 import (
 	"errors"
 	"fmt"
+	"log/slog"
+	"net"
+	"net/netip"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/caarlos0/env/v11"
@@ -62,6 +66,13 @@ type Config struct {
 	EventBufferCapacity      int           `env:"SLINK_EVENT_BUFFER_CAPACITY"       envDefault:"50000"`
 	EventBufferBatchSize     int           `env:"SLINK_EVENT_BUFFER_BATCH_SIZE"     envDefault:"2000"`
 	EventBufferFlushInterval time.Duration `env:"SLINK_EVENT_BUFFER_FLUSH_INTERVAL" envDefault:"500ms"`
+
+	// ── 反向代理白名单（v0.3 H6 hardening）────────────────
+	// 仅当 RemoteAddr 落在这里面的 CIDR 时，才信任 X-Forwarded-For / X-Real-IP。
+	// 默认空 = 不信任 XFF（最安全），生产部署在 LB 后面时必须配置。
+	// 格式：逗号分隔的 CIDR，如 "10.0.0.0/8,172.16.0.0/12,fd00::/8"
+	TrustedProxiesRaw string         `env:"SLINK_TRUSTED_PROXIES" envDefault:""`
+	TrustedProxies    []netip.Prefix `env:"-"` // 由 Validate 解析，不直接吃 env
 }
 
 // Load 读取配置，按优先级合并：环境变量 > .env > 默认值。
@@ -128,7 +139,105 @@ func (c *Config) Validate() error {
 	if c.EventBufferFlushInterval <= 0 {
 		return errors.New("EVENT_BUFFER_FLUSH_INTERVAL must be > 0")
 	}
+	if err := c.validatePProfAddr(); err != nil {
+		return err
+	}
+	prefixes, err := parseTrustedProxies(c.TrustedProxiesRaw)
+	if err != nil {
+		return fmt.Errorf("TRUSTED_PROXIES: %w", err)
+	}
+	c.TrustedProxies = prefixes
+	if !c.IsDev() && len(prefixes) == 0 {
+		// prod 部署在 LB 后面但没配 TrustedProxies = 所有 click_event 的 IP
+		// 都会变成 LB IP（功能受损但不爆炸），值得一句 warn。
+		slog.Warn("TRUSTED_PROXIES is empty in non-dev env; X-Forwarded-For/X-Real-IP will be ignored",
+			"env", c.Env)
+	}
 	return nil
+}
+
+// parseTrustedProxies 把 "10.0.0.0/8,fd00::/8" 解析成 []netip.Prefix。
+// 单个 IP 不带 /N 时按主机视为 /32 或 /128 接受。空字符串返回 nil（不信任 XFF）。
+func parseTrustedProxies(raw string) ([]netip.Prefix, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]netip.Prefix, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// 尝试 CIDR
+		if pfx, err := netip.ParsePrefix(p); err == nil {
+			out = append(out, pfx)
+			continue
+		}
+		// 尝试单 IP
+		addr, err := netip.ParseAddr(p)
+		if err != nil {
+			return nil, fmt.Errorf("entry %q is neither CIDR nor IP: %w", p, err)
+		}
+		bits := addr.BitLen()
+		out = append(out, netip.PrefixFrom(addr, bits))
+	}
+	return out, nil
+}
+
+// validatePProfAddr 防止把 pprof / /debug/stats / /metrics 端口暴露公网。
+//
+// 这些端点合在一起 = 自助 DoS（/debug/pprof/profile?seconds=300 拉满 CPU）+
+// 数据泄漏（heap dump 含 long_url 业务数据）。Day 11 code review 标 H2。
+//
+// 规则：
+//   - 空字符串 → 不启 pprof，放过
+//   - prod 环境 → 必须 loopback（127.0.0.1 / ::1 / localhost），否则报错
+//   - 非 prod  → 非 loopback 仅 warn，留 dev 环境绑 0.0.0.0 的便利
+func (c *Config) validatePProfAddr() error {
+	if c.PProfAddr == "" {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(c.PProfAddr)
+	if err != nil {
+		return fmt.Errorf("PPROF_ADDR %q: %w", c.PProfAddr, err)
+	}
+
+	if isLoopbackHost(host) {
+		return nil
+	}
+
+	// prod 严格拒绝
+	if !c.IsDev() {
+		return fmt.Errorf("PPROF_ADDR %q binds non-loopback host %q in env=%q; "+
+			"pprof / metrics 暴露公网 = 自助 DoS + 数据泄漏。"+
+			"请改用 127.0.0.1 / localhost / ::1，或留空字符串关闭。",
+			c.PProfAddr, host, c.Env)
+	}
+
+	// dev / staging 警告但放过（本地 docker exec 进容器调试要绑 0.0.0.0）
+	slog.Warn("PProfAddr is not loopback; this is only safe in trusted dev environments",
+		"addr", c.PProfAddr, "host", host, "env", c.Env)
+	return nil
+}
+
+// isLoopbackHost 判断 host 是否绑回环。
+// 接受空字符串（":6060" 形式，Go 把空 host 当成绑所有接口；不安全，按非 loopback 处理）。
+func isLoopbackHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	// 字面字符串快速路径
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		// 非 IP 也非 localhost（如自定义 hostname）：保守处理为非 loopback
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 // IsDev 返回当前是否为本地开发环境。

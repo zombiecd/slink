@@ -119,6 +119,42 @@ func TestValidate_Errors(t *testing.T) {
 	}
 }
 
+// H2 hardening: PProfAddr 非 loopback 防护
+func TestValidate_PProfAddr(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     string
+		addr    string
+		wantErr bool
+	}{
+		{"empty addr ok", "prod", "", false},
+		{"prod loopback v4", "prod", "127.0.0.1:6060", false},
+		{"prod loopback v6", "prod", "[::1]:6060", false},
+		{"prod localhost", "prod", "localhost:6060", false},
+		{"prod 0.0.0.0 rejected", "prod", "0.0.0.0:6060", true},
+		{"prod public ip rejected", "prod", "10.0.0.5:6060", true},
+		{"prod empty host rejected", "prod", ":6060", true},
+		{"prod hostname rejected", "prod", "internal-host:6060", true},
+		{"dev 0.0.0.0 allowed", "dev", "0.0.0.0:6060", false},
+		{"dev ip allowed", "development", "192.168.1.10:6060", false},
+		{"prod malformed", "prod", "not-an-addr", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validBase()
+			cfg.Env = tc.env
+			cfg.PProfAddr = tc.addr
+			err := cfg.Validate()
+			if tc.wantErr && err == nil {
+				t.Errorf("expected error for env=%q addr=%q", tc.env, tc.addr)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("unexpected error for env=%q addr=%q: %v", tc.env, tc.addr, err)
+			}
+		})
+	}
+}
+
 func TestIsDev(t *testing.T) {
 	for _, env := range []string{"dev", "development", "local"} {
 		c := &Config{Env: env}
@@ -131,6 +167,46 @@ func TestIsDev(t *testing.T) {
 		if c.IsDev() {
 			t.Errorf("IsDev() should be false for env=%q", env)
 		}
+	}
+}
+
+// H6 hardening: TrustedProxies 解析 + Validate
+func TestValidate_TrustedProxies(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    int // 解析后 prefix 数
+		wantErr bool
+	}{
+		{"empty", "", 0, false},
+		{"whitespace only", "   ", 0, false},
+		{"single CIDR v4", "10.0.0.0/8", 1, false},
+		{"single CIDR v6", "fd00::/8", 1, false},
+		{"single bare IP v4", "192.168.1.1", 1, false},
+		{"multiple mixed", "10.0.0.0/8, 172.16.0.0/12 ,fd00::/8", 3, false},
+		{"empty entries skipped", "10.0.0.0/8,,,", 1, false},
+		{"invalid junk", "not-an-ip", 0, true},
+		{"invalid CIDR", "10.0.0.0/99", 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validBase()
+			cfg.TrustedProxiesRaw = tc.raw
+			err := cfg.Validate()
+			if tc.wantErr && err == nil {
+				t.Errorf("expected error for raw=%q", tc.raw)
+				return
+			}
+			if !tc.wantErr {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+					return
+				}
+				if got := len(cfg.TrustedProxies); got != tc.want {
+					t.Errorf("len(TrustedProxies) = %d, want %d", got, tc.want)
+				}
+			}
+		})
 	}
 }
 

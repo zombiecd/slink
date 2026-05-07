@@ -1,6 +1,7 @@
 package api
 
 import (
+	"net/netip"
 	"strings"
 
 	"github.com/fasthttp/router"
@@ -32,6 +33,12 @@ type Server struct {
 // Config 是 api 层需要的最小子集（不直接吃 *config.Config，避免反向依赖）。
 type Config struct {
 	BaseURL string // 用于生成 short_url 字段（如 https://o.cn）
+
+	// TrustedProxies 是反向代理白名单（CIDR）。
+	// 仅当 RemoteAddr 命中其中一条时，才信任 X-Forwarded-For / X-Real-IP；
+	// 否则把 RemoteAddr 当真实 IP（v0.3 H6 hardening）。
+	// nil = 不信任 XFF（最安全的默认）。
+	TrustedProxies []netip.Prefix
 }
 
 // NewServer 构造 Server。

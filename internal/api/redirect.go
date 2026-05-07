@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -139,7 +140,7 @@ func (s *Server) enqueueClickEvent(ctx *fasthttp.RequestCtx, code string) {
 	evt := event.ClickEvent{
 		EventID:   newEventID(),
 		Code:      code,
-		IP:        clientIP(ctx),
+		IP:        s.clientIP(ctx),
 		UserAgent: string(ctx.Request.Header.UserAgent()),
 		Referer:   string(ctx.Request.Header.Referer()),
 		TS:        time.Now().UTC(),
@@ -151,16 +152,31 @@ func (s *Server) enqueueClickEvent(ctx *fasthttp.RequestCtx, code string) {
 	}
 }
 
-// clientIP 从 X-Forwarded-For / X-Real-IP / RemoteAddr 三处提取客户端 IP。
+// clientIP 从 RemoteAddr / X-Forwarded-For / X-Real-IP 提取客户端 IP。
 //
-// 注意：生产部署在 LB 后面时 X-Forwarded-For 才可信。
-// v0.1 简化处理；v0.3 加 trusted proxy 列表。
+// v0.3 H6 hardening：
+//   - 仅当 RemoteAddr 命中 cfg.TrustedProxies 时才信任 XFF / X-Real-IP
+//   - 否则一律以 RemoteAddr 为准
+//   - cfg.TrustedProxies 为空（默认）= 永远不信任 XFF
+//
+// 这样防止任意 client 通过自定义 X-Forwarded-For header 投毒 click_events.ip 列。
 //
 // fasthttp Header.Peek 返回 zero-copy []byte（仅 handler 期间有效），
 // net.ParseIP 会做拷贝，结果安全。
-func clientIP(ctx *fasthttp.RequestCtx) net.IP {
+func (s *Server) clientIP(ctx *fasthttp.RequestCtx) net.IP {
+	var remote net.IP
+	if tcp, ok := ctx.RemoteAddr().(*net.TCPAddr); ok {
+		remote = tcp.IP
+	}
+
+	// 不信任 XFF：直接用 RemoteAddr
+	if !s.isTrustedProxy(remote) {
+		return remote
+	}
+
+	// RemoteAddr 在白名单内（确认是 LB / 反代）→ 才相信它转发的客户端 IP
 	if xff := ctx.Request.Header.Peek("X-Forwarded-For"); len(xff) > 0 {
-		// XFF 可能是 "client, proxy1, proxy2"，取第一个
+		// XFF 可能是 "client, proxy1, proxy2"，取最左（最初客户端）
 		first := strings.TrimSpace(strings.SplitN(string(xff), ",", 2)[0])
 		if ip := net.ParseIP(first); ip != nil {
 			return ip
@@ -171,11 +187,26 @@ func clientIP(ctx *fasthttp.RequestCtx) net.IP {
 			return ip
 		}
 	}
-	// fasthttp 已解析好 RemoteAddr，net.Addr 接口
-	if tcpAddr, ok := ctx.RemoteAddr().(*net.TCPAddr); ok {
-		return tcpAddr.IP
+	return remote
+}
+
+// isTrustedProxy 判断 ip 是否落在 cfg.TrustedProxies 任一 CIDR 内。
+// 名单为空时永远返回 false（最安全的默认）。
+func (s *Server) isTrustedProxy(ip net.IP) bool {
+	if ip == nil || len(s.cfg.TrustedProxies) == 0 {
+		return false
 	}
-	return nil
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap() // ::ffff:1.2.3.4 → 1.2.3.4
+	for _, p := range s.cfg.TrustedProxies {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // hexChars 是 hex 编码查找表（小写），用于 newEventID 的零分配格式化。

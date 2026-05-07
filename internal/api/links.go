@@ -15,6 +15,14 @@ import (
 	"github.com/zombiecd/slink/internal/store"
 )
 
+// MaxIdempotencyKeyLen 是接受的 Idempotency-Key 最大长度（字节）。
+//
+// IETF draft-ietf-httpapi-idempotency-key-header 建议 ≤ 255。
+// 我们更严：128 字节足以表达 UUID/ULID 等业界常见格式，
+// 防止超长 key spam 打到 DB 做无意义的 SELECT、撑大 idem_key 索引。
+// DB 侧另有 CHECK (char_length(idem_key) <= 255) 兜底防御（migration 0002）。
+const MaxIdempotencyKeyLen = 128
+
 // handleCreateLink 处理 POST /api/links。
 //
 // fasthttp 迁移要点（vs Day 6 net/http 版）：
@@ -52,6 +60,13 @@ func (s *Server) handleCreateLink(ctx *fasthttp.RequestCtx) {
 	}
 
 	idemKey := strings.TrimSpace(string(ctx.Request.Header.Peek("Idempotency-Key")))
+
+	// 长度防御：超过 MaxIdempotencyKeyLen 直接 400，不让攻击者用超长随机串
+	// 撑大 DB 索引或制造无效 SELECT。
+	if len(idemKey) > MaxIdempotencyKeyLen {
+		writeError(ctx, http.StatusBadRequest, ErrIdemKeyTooLong, "Idempotency-Key too long")
+		return
+	}
 
 	// 3. 幂等命中：返回已有记录（早退避免做无用功 + 浪费号段）
 	if idemKey != "" {

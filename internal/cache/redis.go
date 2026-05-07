@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -61,10 +62,22 @@ func NewClient(ctx context.Context, c ClientConfig) (*Client, error) {
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		_ = rdb.Close()
-		return nil, fmt.Errorf("ping redis: %w", err)
+		// v0.3 H3 防御纵深：go-redis 报错通常不会回灌密码（WRONGPASS 只说错误码），
+		// 但万一上游版本变化把 password 卷进 err，这里做一道字符串清理。
+		// 故意不用 %w —— 防止 errors.Unwrap 拿到原 err。
+		return nil, fmt.Errorf("ping redis: %s", redactPassword(err.Error(), c.Password))
 	}
 
 	return &Client{rdb: rdb}, nil
+}
+
+// redactPassword 把 msg 中可能出现的 password 子串替换成 ***。
+// password 为空时直接返回 msg。
+func redactPassword(msg, password string) string {
+	if password == "" || msg == "" {
+		return msg
+	}
+	return strings.ReplaceAll(msg, password, "redacted")
 }
 
 // Ping 走一次 PING 命令验证 Redis 可达。
