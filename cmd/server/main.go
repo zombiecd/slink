@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	version       = "v0.3-day8"
+	version       = "v0.3-day9"
 	shutdownGrace = 10 * time.Second
 
 	// 主端口允许的最大请求体（POST /api/links 仅吃几 KB JSON）。
@@ -117,13 +117,15 @@ func run() error {
 		"l1_ttl", cfg.LocalCacheTTL)
 
 	eventBuf := event.NewBuffer(clickRepo, event.BufferConfig{
-		Capacity:      10_000,
-		BatchSize:     1000,
-		FlushInterval: time.Second,
+		Capacity:      cfg.EventBufferCapacity,
+		BatchSize:     cfg.EventBufferBatchSize,
+		FlushInterval: cfg.EventBufferFlushInterval,
 	})
 	eventBuf.Start()
 	slog.Info("event buffer started",
-		"capacity", 10_000, "batch_size", 1000, "flush_interval", "1s")
+		"capacity", cfg.EventBufferCapacity,
+		"batch_size", cfg.EventBufferBatchSize,
+		"flush_interval", cfg.EventBufferFlushInterval)
 
 	// ── 6. 建 API server + 路由（健康检查 + API + 跳转）─────
 	//
@@ -153,7 +155,7 @@ func run() error {
 		IdleTimeout:        60 * time.Second,
 	}
 
-	// ── 6.6 pprof 单独端口（仍用 net/http，外部工具兼容）────
+	// ── 6.6 pprof + admin 单独端口（仍用 net/http，外部工具兼容）────
 	//
 	// 为什么不迁 fasthttp：
 	//   1. net/http/pprof 是标准库，go tool pprof / curl / 浏览器都直接认它
@@ -161,16 +163,21 @@ func run() error {
 	//      但徒增一层 net/http ↔ fasthttp 适配开销，pprof 又不在 hot path
 	//   3. pprof 端口本来就是低频访问 + 仅本机绑定，性能不重要
 	// 业界标准（Kubernetes / Prometheus / Etcd 都把 pprof 单独绑）。
+	//
+	// /debug/stats（Day 9 新增）也挂这个 admin 端口：
+	//   admin 数据不应跟生产流量同端口，避免被外网拉到 → 沿用 pprof 的本地绑定模型。
 	if cfg.PProfAddr != "" {
+		http.HandleFunc("/debug/stats", statsHandler(linkCache, eventBuf, generator, time.Now()))
+
 		pprofSrv := &http.Server{
 			Addr:              cfg.PProfAddr,
-			Handler:           http.DefaultServeMux, // pprof init() 把路由注册到这里
+			Handler:           http.DefaultServeMux, // pprof init() + /debug/stats
 			ReadHeaderTimeout: 5 * time.Second,
 		}
 		go func() {
-			slog.Info("pprof listening (net/http)", "addr", cfg.PProfAddr)
+			slog.Info("admin listening (pprof + /debug/stats)", "addr", cfg.PProfAddr)
 			if err := pprofSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				slog.Error("pprof server", "err", err)
+				slog.Error("admin server", "err", err)
 			}
 		}()
 		defer func() {
@@ -316,4 +323,66 @@ func statusFor(ok bool) string {
 		return "ok"
 	}
 	return "degraded"
+}
+
+// ──────────────────────────────────────────────────────────
+//                       /debug/stats（Day 9）
+// ──────────────────────────────────────────────────────────
+//
+// 一站式观测：L1 命中率 + event buffer 状态 + ID 号段进度 + uptime。
+// 仅挂 admin 端口（默认 127.0.0.1:6060），不暴露给外网。
+//
+// 用途：
+//  1. bench 后核对 L1 hit rate（不再靠"profile 间接估"）
+//  2. 监控 event buffer Used/Capacity，提前预警 dropped
+//  3. 简历讲故事时有现成数字（"L1 命中 99.7% / dropped 0 / uptime 2 小时"）
+
+type localCacheStatsView struct {
+	Hits    uint64  `json:"hits"`
+	Misses  uint64  `json:"misses"`
+	HitRate float64 `json:"hit_rate"` // 计算字段，便于一眼看出
+}
+
+type linkCacheStats struct {
+	L1 localCacheStatsView `json:"l1"`
+}
+
+type statsResp struct {
+	Version       string          `json:"version"`
+	UptimeSeconds int64           `json:"uptime_seconds"`
+	LinkCache     linkCacheStats  `json:"link_cache"`
+	EventBuffer   event.Stats     `json:"event_buffer"`
+	IDGenerator   id.BufferStat   `json:"id_generator"`
+}
+
+func statsHandler(
+	lc *cache.LinkCache,
+	eb *event.Buffer,
+	gen *id.Generator,
+	startTime time.Time,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		l1 := lc.LocalStats()
+		hitRate := 0.0
+		if total := l1.Hits + l1.Misses; total > 0 {
+			hitRate = float64(l1.Hits) / float64(total)
+		}
+
+		resp := statsResp{
+			Version:       version,
+			UptimeSeconds: int64(time.Since(startTime).Seconds()),
+			LinkCache: linkCacheStats{
+				L1: localCacheStatsView{
+					Hits:    l1.Hits,
+					Misses:  l1.Misses,
+					HitRate: hitRate,
+				},
+			},
+			EventBuffer: eb.Stats(),
+			IDGenerator: gen.Stat(),
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}
 }

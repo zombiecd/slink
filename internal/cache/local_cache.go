@@ -20,11 +20,14 @@ type localEntry struct {
 	link *model.Link
 }
 
-// localStats 是 L1 的运行时观测，bench 时用来核算命中率。
-// 三个计数器都用 atomic 累加；读出时是某一时刻的快照。
-type localStats struct {
-	Hits   uint64
-	Misses uint64
+// LocalCacheStats 是 L1 的运行时观测，bench 时用来核算命中率。
+// 两个计数器都用 atomic 累加；读出时是某一时刻的快照。
+//
+// 公开类型（与 cache.Stats / event.Stats 风格一致），
+// 上层（如 /debug/stats endpoint）可直接 JSON marshal。
+type LocalCacheStats struct {
+	Hits   uint64 `json:"hits"`
+	Misses uint64 `json:"misses"`
 }
 
 // localCache 是 LinkCache 的进程内 L1。
@@ -82,11 +85,11 @@ func (c *localCache) Del(key string) {
 }
 
 // Stats 取一个观测快照。
-func (c *localCache) Stats() localStats {
+func (c *localCache) Stats() LocalCacheStats {
 	if c == nil {
-		return localStats{}
+		return LocalCacheStats{}
 	}
-	return localStats{
+	return LocalCacheStats{
 		Hits:   c.hits.Load(),
 		Misses: c.misses.Load(),
 	}

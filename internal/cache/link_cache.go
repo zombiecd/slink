@@ -152,7 +152,7 @@ func NewLinkCache(rdb *Client, opts ...LinkCacheOption) *LinkCache {
 
 // LocalStats 返回 L1 命中统计快照（bench/observability 用）。
 // L1 未启用时返回零值。
-func (lc *LinkCache) LocalStats() localStats {
+func (lc *LinkCache) LocalStats() LocalCacheStats {
 	return lc.local.Stats()
 }
 

@@ -181,12 +181,26 @@ func (b *Buffer) Stop(stopCtx context.Context) error {
 	}
 }
 
-// Stats 返回累计指标快照。
+// Stats 返回累计指标 + 实时容量观测的快照。
+//
+// 累计计数器（atomic int64）：
+//   - Enqueued: Enqueue 成功（进 channel）次数
+//   - Dropped:  Enqueue 满或 Stop 后被丢弃次数
+//   - Flushed:  flush 成功批次数
+//   - FlushErr: flush 失败批次数
+//
+// 实时观测（每次 Stats() 调用现读）：
+//   - Capacity: channel 容量上限（启动时固定）
+//   - Used:     当前 channel 长度（即未消费的事件数）
+//
+// Used / Capacity 接近 1.0 是 buffer 即将爆的信号。
 type Stats struct {
-	Enqueued int64
-	Dropped  int64
-	Flushed  int64
-	FlushErr int64
+	Enqueued int64 `json:"enqueued"`
+	Dropped  int64 `json:"dropped"`
+	Flushed  int64 `json:"flushed"`
+	FlushErr int64 `json:"flush_err"`
+	Capacity int   `json:"capacity"`
+	Used     int   `json:"used"`
 }
 
 func (b *Buffer) Stats() Stats {
@@ -195,6 +209,8 @@ func (b *Buffer) Stats() Stats {
 		Dropped:  b.dropped.Load(),
 		Flushed:  b.flushed.Load(),
 		FlushErr: b.flushErr.Load(),
+		Capacity: cap(b.ch),
+		Used:     len(b.ch),
 	}
 }
 

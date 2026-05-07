@@ -61,6 +61,13 @@ type Config struct {
 	LocalCacheSize int           `env:"SLINK_LOCAL_CACHE_SIZE" envDefault:"4096"`
 	LocalCacheTTL  time.Duration `env:"SLINK_LOCAL_CACHE_TTL"  envDefault:"1m"`
 
+	// 异步事件 buffer 配置（Day 9 调优）。
+	// Day 8 实测 93k RPS 把 10k/1k/1s 的默认值打爆（63% 丢）。
+	// 调到 50k/2k/500ms 后 dropped 趋零，内存约 5MB（5w × 100B/event）。
+	EventBufferCapacity      int           `env:"SLINK_EVENT_BUFFER_CAPACITY"       envDefault:"50000"`
+	EventBufferBatchSize     int           `env:"SLINK_EVENT_BUFFER_BATCH_SIZE"     envDefault:"2000"`
+	EventBufferFlushInterval time.Duration `env:"SLINK_EVENT_BUFFER_FLUSH_INTERVAL" envDefault:"500ms"`
+
 	// ── 限流 ────────────────────────────────────────────
 	RateLimitPerIP float64 `env:"SLINK_RATE_LIMIT_PER_IP" envDefault:"100"`
 	RateLimitBurst int     `env:"SLINK_RATE_LIMIT_BURST"  envDefault:"200"`
@@ -125,6 +132,19 @@ func (c *Config) Validate() error {
 	}
 	if c.RateLimitBurst <= 0 {
 		return errors.New("RATE_LIMIT_BURST must be > 0")
+	}
+	if c.EventBufferCapacity <= 0 {
+		return errors.New("EVENT_BUFFER_CAPACITY must be > 0")
+	}
+	if c.EventBufferBatchSize <= 0 {
+		return errors.New("EVENT_BUFFER_BATCH_SIZE must be > 0")
+	}
+	if c.EventBufferBatchSize > c.EventBufferCapacity {
+		return fmt.Errorf("EVENT_BUFFER_BATCH_SIZE (%d) cannot exceed EVENT_BUFFER_CAPACITY (%d)",
+			c.EventBufferBatchSize, c.EventBufferCapacity)
+	}
+	if c.EventBufferFlushInterval <= 0 {
+		return errors.New("EVENT_BUFFER_FLUSH_INTERVAL must be > 0")
 	}
 	return nil
 }

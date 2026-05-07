@@ -237,11 +237,14 @@ func (db *DoubleBuffer) Stat() BufferStat {
 
 // BufferStat 是 DoubleBuffer 的瞬时快照。
 type BufferStat struct {
-	CurLow, CurHigh, CurCursor int64
-	CurUsage                   float64
-	NextReady                  bool
-	NextLow, NextHigh          int64
-	Refilling                  bool
+	CurLow    int64   `json:"cur_low"`
+	CurHigh   int64   `json:"cur_high"`
+	CurCursor int64   `json:"cur_cursor"`
+	CurUsage  float64 `json:"cur_usage"`
+	NextReady bool    `json:"next_ready"`
+	NextLow   int64   `json:"next_low"`
+	NextHigh  int64   `json:"next_high"`
+	Refilling bool    `json:"refilling"`
 }
 
 // ────────────────────────────────────────────────────────────

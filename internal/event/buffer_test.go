@@ -142,6 +142,43 @@ func TestBuffer_DropWhenFull(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────
+// Day 9: Stats 暴露 Capacity / Used 实时观测
+// ─────────────────────────────────────────────────────────
+
+// Capacity 来自启动配置；sink 卡死时 channel 装多少 Used 就读多少。
+func TestBuffer_Stats_CapacityAndUsed(t *testing.T) {
+	sink := &fakeSink{delay: time.Hour} // sink 卡住 → enqueued 全堆 channel
+	buf := NewBuffer(sink, BufferConfig{
+		Capacity:      8,
+		BatchSize:     1000,
+		FlushInterval: time.Hour,
+	})
+	buf.Start()
+	defer buf.Stop(context.Background())
+
+	// 启动时 Used == 0
+	s0 := buf.Stats()
+	if s0.Capacity != 8 {
+		t.Errorf("Capacity = %d, want 8", s0.Capacity)
+	}
+	if s0.Used != 0 {
+		t.Errorf("Used at start = %d, want 0", s0.Used)
+	}
+
+	// 灌 5 条进来（< Capacity，全成功）
+	for i := 0; i < 5; i++ {
+		_ = buf.Enqueue(context.Background(), makeEvent("c"))
+	}
+
+	// 等 run() 把第一条从 channel 取走（drain 到 batch 里），Used 可能是 4 或 5
+	// 这里只断言 Used > 0 且不超过 Capacity
+	waitFor(t, time.Second, func() bool {
+		s := buf.Stats()
+		return s.Used >= 1 && s.Used <= s.Capacity
+	})
+}
+
+// ─────────────────────────────────────────────────────────
 // Stop 时 drain 残余事件做最后一次 flush
 // ─────────────────────────────────────────────────────────
 
