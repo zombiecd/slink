@@ -63,6 +63,22 @@ make run
 
 服务起在 `http://localhost:18080`。
 
+## 配置文件分工
+
+仓库根有 `.env.example`，`deploy/observability/` 下有几份 yaml/json，**它们是给不同进程用的，不是同一份配置的多份拷贝**。
+
+| 文件 | 谁读它 | schema 谁定义 | 注入方式 |
+|---|---|---|---|
+| `.env` / `.env.example` | **slink server**（Go binary 本进程）| 本项目（`internal/config/config.go` 的 env tag）| `godotenv` 启动期加载 + `os.Getenv` |
+| `deploy/observability/prometheus.yml` | **prom/prometheus 容器** | Prometheus 官方 schema | `docker compose` volume mount |
+| `deploy/observability/grafana/provisioning/datasources/*.yml` | **grafana/grafana 容器** | Grafana provisioning schema | 同上 |
+| `deploy/observability/grafana/provisioning/dashboards/*.yml` | 同上 | 同上 | 同上 |
+| `deploy/observability/grafana/dashboards/*.json` | 同上 | Grafana dashboard JSON schema | 同上 |
+
+slink server 自己的代码 `grep -rn "deploy/observability/" --include="*.go"` 是 **0 命中**——它只读环境变量，不读任何 yaml。`deploy/observability/` 全部内容是 `docker-compose.yml` 通过 volume mount 投递给第三方容器的。
+
+**为什么不统一成一种格式**：Prometheus 和 Grafana 进程只接受它们自己定义的 yaml schema，无法改写成 env 或别的格式；slink server 选 12-factor 风格的 env vars 是 [ADR-0003](docs/adr/0003-config-library.md) 拍板的（K8s ConfigMap/Secret envFrom 注入是事实标准）。强行写一份 master config + generator 仍要落出 3 套文件 + 多一层生成脚本，没有真减少。
+
 ### 创建短链
 
 ```bash

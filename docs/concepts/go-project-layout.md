@@ -117,9 +117,9 @@ Rob Pike、Russ Cox 等 Go 设计者**反对** `pkg/`。但流行项目（Kubern
 |---|---|---|
 | `api/` | OpenAPI / proto 文件 | v0.2 加 OpenAPI 后用 |
 | `web/` 或 `ui/` | 前端代码 | v0.3 加 Web UI 时用 |
-| `scripts/` | 运维脚本 | ✅ 已建（暂空） |
-| `deploy/` | K8s yaml / Helm chart | ✅ 已建（暂空） |
-| `configs/` | 配置文件模板 | ✅ 已建（暂空） |
+| `scripts/` | 运维脚本 | ✅ 已建（含 wrk 压测脚本） |
+| `deploy/` | K8s yaml / Helm chart / 容器配置 mount 源 | ✅ 已建（含 observability/） |
+| `configs/` | 应用自身配置模板 | ❌ 不用——slink 走 12-factor `.env` |
 | `docs/` | 文档（你在这） | ✅ |
 | `test/` | 集成测试 / e2e | v0.2 加 |
 | `examples/` | 示例代码 | 暂不需要 |
@@ -159,8 +159,8 @@ slink/
 │   ├── model/                 ← 领域类型
 │   └── store/                 ← PG
 ├── migrations/                ← SQL 迁移
-├── configs/                   ← 配置模板（v0.2+）
-├── deploy/                    ← K8s 部署清单（v0.3+）
+├── deploy/                    ← 部署资产
+│   └── observability/         ← prom/grafana 容器 mount 源
 ├── scripts/                   ← 工具脚本（压测脚本等）
 ├── docs/                      ← 文档（你在这）
 ├── docker-compose.yml         ← 本地依赖

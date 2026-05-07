@@ -60,7 +60,7 @@ services:
       # 主机端口偏移，避开默认 9090
       - "19090:9090"
     volumes:
-      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - slink-prometheus-data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -91,8 +91,8 @@ services:
       # 关掉首页"创建仪表盘"等引导，进来直接是我们的 dashboard
       GF_USERS_DEFAULT_THEME: light
     volumes:
-      - ./configs/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./configs/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - slink-grafana-data:/var/lib/grafana
     depends_on:
       prometheus:
