@@ -16,6 +16,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	_ "net/http/pprof" // 注册 /debug/pprof/* 路由到 http.DefaultServeMux
 	"os"
 	"os/signal"
 	"sync"
@@ -134,6 +135,32 @@ func run() error {
 		Addr:              cfg.Addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	// ── 6.5 pprof 单独端口（仅本机访问）─────────────────────
+	//
+	// 为什么单独端口而不是挂在主端口：
+	//   1. pprof 暴露 goroutine / heap / cpu profile，外部访问 = 信息泄漏
+	//   2. 业务端口加 /debug/pprof 路由污染，影响路由表性能
+	//   3. 单独 server 自带独立 mux（http.DefaultServeMux），改动面小
+	// 业界标准（Kubernetes / Prometheus / Etcd 都这么做）。
+	if cfg.PProfAddr != "" {
+		pprofSrv := &http.Server{
+			Addr:              cfg.PProfAddr,
+			Handler:           http.DefaultServeMux, // pprof init() 把路由注册到这里
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		go func() {
+			slog.Info("pprof listening", "addr", cfg.PProfAddr)
+			if err := pprofSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("pprof server", "err", err)
+			}
+		}()
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = pprofSrv.Shutdown(ctx)
+		}()
 	}
 
 	// ── 7. 启动 + 优雅停机 ─────────────────────────────────

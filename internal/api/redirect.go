@@ -2,10 +2,9 @@ package api
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
-	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strings"
@@ -84,7 +83,14 @@ func (s *Server) handleRedirect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 重定向 → 用户立即跳走
-	http.Redirect(w, r, link.LongURL, http.StatusFound)
+	//
+	// 手写替代 http.Redirect(w, r, url, 302)：
+	//   标准库会写一段 HTML body（"<a href=...>Found</a>"）+ 设置 Content-Type，
+	//   并对 url 做 escapeHTML。302 的 body 浏览器根本不展示——纯浪费。
+	//   profile 显示 http.Redirect cum alloc 占 21% 总分配。
+	//   手写：仅写 Location header + 302 status code → 一个写头一个写状态。
+	w.Header().Set("Location", link.LongURL)
+	w.WriteHeader(http.StatusFound)
 
 	// 异步事件投递（**响应已发完**，这里出错也不影响用户）
 	s.enqueueClickEvent(r, code)
@@ -108,18 +114,17 @@ func (s *Server) dbLoader(code string) cache.LinkLoader {
 
 // enqueueClickEvent 收集一个 ClickEvent 投递到 Eventer。
 //
-// 在 http.Redirect 之后调用：响应已写出，这里阻塞也只阻塞当前 goroutine
+// 在 redirect 之后调用：响应已写出，这里阻塞也只阻塞当前 goroutine
 // 的"清理时间"，不影响用户体验。但 Eventer 实现自己应该是非阻塞的。
 //
-// 不传 r.Context()：跳转响应已发完，请求 context 即将被 cancel；
-// 用 background context + 短 timeout 让事件入 channel 不被打断。
+// 不传 r.Context()：跳转响应已发完，请求 context 即将被 cancel。
+// 也不创建 context.WithTimeout —— Buffer.Enqueue 默认是 select-default
+// 非阻塞路径，根本不读 ctx。每次请求 new timer + cancel 是纯浪费。
+// （profile 显示 context.WithDeadlineCause 占 5.5% 总分配）
 func (s *Server) enqueueClickEvent(r *http.Request, code string) {
 	if s.events == nil {
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
 
 	evt := event.ClickEvent{
 		EventID:   newEventID(),
@@ -130,7 +135,7 @@ func (s *Server) enqueueClickEvent(r *http.Request, code string) {
 		TS:        time.Now().UTC(),
 	}
 
-	if err := s.events.Enqueue(ctx, evt); err != nil {
+	if err := s.events.Enqueue(context.Background(), evt); err != nil {
 		// Enqueue 失败（buffer 满 / 关闭中）：仅记日志，不影响跳转
 		slog.Warn("enqueue click event failed", "code", code, "err", err)
 	}
@@ -160,23 +165,54 @@ func clientIP(r *http.Request) net.IP {
 	return net.ParseIP(host)
 }
 
+// hexChars 是 hex 编码查找表（小写），用于 newEventID 的零分配格式化。
+const hexChars = "0123456789abcdef"
+
 // newEventID 生成符合 RFC 4122 v4 的 UUID 字符串。
 //
-// 为啥不引 google/uuid？短链项目还没到引入 uuid 库的复杂度；
-// 16 字节随机 + 设置 v4/variant 标记位是 ~10 行代码。
+// 这里不用 crypto/rand：
+//   - ClickEvent 的 EventID 仅用于"事件去重 / 日志关联"，不是安全凭证
+//   - profile 显示 crypto/internal/sysrand.Read 走 syscall（getentropy/urandom），
+//     且 fmt.Sprintf("%08x-...", b[0:4], ...) 内部 sub-slice + format 反射是 alloc 大头
+//
+// 改为 math/rand/v2 ChaCha8 + 直接 byte buffer 填 hex：
+//   - rand/v2 是无锁、纯用户态的 ChaCha8 PRNG，每次 Uint64 几个 ns
+//   - 36 字节固定栈分配 + 一次 string 转换，省掉 fmt.Sprintf 5 个 sub-slice 反射
 //
 // 输出形如：xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx（y ∈ {8,9,a,b}）
 // PG 列 event_id UUID 直接接受这种字符串。
 func newEventID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// crypto/rand 失败极罕见（随机源损坏），退化用 ts 兜底，
-		// 但此时无法构成合法 UUID — 上层会拒绝，让事件丢弃即可
-		return time.Now().UTC().Format("20060102-1504-4000-8000-000000000000")
+	// 用 2 个 uint64（16 字节）作为随机源，避开 crypto/rand 的 syscall
+	hi := rand.Uint64()
+	lo := rand.Uint64()
+
+	// 按 RFC 4122 v4 设置标记位：
+	//   字节 6 高 4 位 = 0x40（version 4）
+	//   字节 8 高 2 位 = 0x80（variant 10xx）
+	// hi 的字节 0..7：[0..7]，字节 6 在 hi 中是 (hi >> 8) & 0xff
+	// lo 的字节 8..15：[8..15]，字节 8 在 lo 中是 (lo >> 56) & 0xff
+	hi = (hi & 0xffff_ffff_ffff_0fff) | 0x0000_0000_0000_4000 // version 4
+	lo = (lo & 0x3fff_ffff_ffff_ffff) | 0x8000_0000_0000_0000 // variant 10xx
+
+	// 36 字节：32 hex + 4 dash
+	var buf [36]byte
+	// 写 hex 的小工具（in-place）
+	writeHex := func(off int, n uint64, nibbles int) {
+		for i := nibbles - 1; i >= 0; i-- {
+			buf[off+i] = hexChars[n&0xf]
+			n >>= 4
+		}
 	}
-	// 设置 v4 (xxxx-xxxx-4xxx-yxxx-...) 和 variant (10xx)
-	b[6] = (b[6] & 0x0f) | 0x40 // version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // variant RFC4122
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	// 8-4-4-4-12 = 32 hex + 4 dash
+	writeHex(0, hi>>32, 8)        // 8 hex from hi[0..3]
+	buf[8] = '-'
+	writeHex(9, (hi>>16)&0xffff, 4) // 4 hex from hi[4..5]
+	buf[13] = '-'
+	writeHex(14, hi&0xffff, 4)    // 4 hex from hi[6..7]
+	buf[18] = '-'
+	writeHex(19, lo>>48, 4)       // 4 hex from lo[0..1]
+	buf[23] = '-'
+	writeHex(24, lo&0xffff_ffff_ffff, 12) // 12 hex from lo[2..7]
+
+	return string(buf[:])
 }

@@ -31,6 +31,11 @@ type Config struct {
 	LogLevel string `env:"SLINK_LOG_LEVEL" envDefault:"info"`
 	Env      string `env:"SLINK_ENV"       envDefault:"dev"`
 
+	// PProfAddr 是 net/http/pprof 的监听地址。
+	// 单独端口避免污染主端口、避免外部访问 profile 数据。
+	// 设为空字符串则不启 pprof。
+	PProfAddr string `env:"SLINK_PPROF_ADDR" envDefault:"127.0.0.1:6060"`
+
 	// ── PostgreSQL ──────────────────────────────────────
 	PGDSN      string `env:"SLINK_PG_DSN,required"`
 	PGMaxConns int32  `env:"SLINK_PG_MAX_CONNS" envDefault:"20"`
