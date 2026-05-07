@@ -51,6 +51,60 @@ services:
       - "--maxmemory-policy"
       - "allkeys-lru"
 
+  # ── Day 10: Prometheus + Grafana 可观测性栈 ────────────────
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: slink-prometheus
+    restart: unless-stopped
+    ports:
+      # 主机端口偏移，避开默认 9090
+      - "19090:9090"
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - slink-prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle" # 允许 POST /-/reload 热重载配置
+    extra_hosts:
+      # 让 prometheus 容器能访问 host 上的 slink server :6060
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: slink-grafana
+    restart: unless-stopped
+    ports:
+      - "13000:3000"
+    environment:
+      # 本地开发用 admin/admin，生产环境必须改
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      # 关掉首页"创建仪表盘"等引导，进来直接是我们的 dashboard
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./configs/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - slink-grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   slink-pg-data:
   slink-redis-data:
+  slink-prometheus-data:
+  slink-grafana-data:

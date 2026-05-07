@@ -1,0 +1,28 @@
+# Prometheus scrape 配置（Day 10）
+#
+# 设计：
+#  - slink server 跑在 host（mac），不在容器里，所以 prometheus 容器要通过
+#    host.docker.internal 拉 host 的 :6060
+#  - 抓取周期 5s（开发足够；生产建议 15s）
+#  - scrape_timeout < scrape_interval（避免重叠）
+
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: slink
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - host.docker.internal:6060
+        labels:
+          service: slink
+          env: dev
+
+  # Prometheus 自己的指标（运维 Prometheus 本身用）
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090

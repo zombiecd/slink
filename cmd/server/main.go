@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/valyala/fasthttp"
 
 	"github.com/zombiecd/slink/internal/api"
@@ -33,11 +34,12 @@ import (
 	"github.com/zombiecd/slink/internal/config"
 	"github.com/zombiecd/slink/internal/event"
 	"github.com/zombiecd/slink/internal/id"
+	"github.com/zombiecd/slink/internal/metrics"
 	"github.com/zombiecd/slink/internal/store"
 )
 
 const (
-	version       = "v0.3-day9"
+	version       = "v0.3-day10"
 	shutdownGrace = 10 * time.Second
 
 	// 主端口允许的最大请求体（POST /api/links 仅吃几 KB JSON）。
@@ -116,6 +118,14 @@ func run() error {
 		"l1_size", cfg.LocalCacheSize,
 		"l1_ttl", cfg.LocalCacheTTL)
 
+	// ── Day 10: Prometheus metrics 注册 ──────────────────
+	// 通过闭包注入业务对象的 Stats getter，metrics 包零依赖业务包。
+	metricsReg := metrics.New()
+	metricsReg.BindLocalCache(
+		func() float64 { return float64(linkCache.LocalStats().Hits) },
+		func() float64 { return float64(linkCache.LocalStats().Misses) },
+	)
+
 	eventBuf := event.NewBuffer(clickRepo, event.BufferConfig{
 		Capacity:      cfg.EventBufferCapacity,
 		BatchSize:     cfg.EventBufferBatchSize,
@@ -126,6 +136,17 @@ func run() error {
 		"capacity", cfg.EventBufferCapacity,
 		"batch_size", cfg.EventBufferBatchSize,
 		"flush_interval", cfg.EventBufferFlushInterval)
+
+	// 把 event buffer 的 stats 接入 Prometheus
+	metricsReg.BindEventBuffer(metrics.EventBufferGetters{
+		Enqueued: func() float64 { return float64(eventBuf.Stats().Enqueued) },
+		Dropped:  func() float64 { return float64(eventBuf.Stats().Dropped) },
+		Flushed:  func() float64 { return float64(eventBuf.Stats().Flushed) },
+		FlushErr: func() float64 { return float64(eventBuf.Stats().FlushErr) },
+		Used:     func() float64 { return float64(eventBuf.Stats().Used) },
+		Capacity: func() float64 { return float64(eventBuf.Stats().Capacity) },
+	})
+	metricsReg.BindIDGenerator(func() float64 { return generator.Stat().CurUsage })
 
 	// ── 6. 建 API server + 路由（健康检查 + API + 跳转）─────
 	//
@@ -146,8 +167,11 @@ func run() error {
 	//   MaxRequestBodySize 16KB 远小于默认 4MB，防 DoS
 	//   ReadTimeout/WriteTimeout 10s 防慢速攻击
 	//   IdleTimeout 60s    keep-alive 复用上限
+	// Day 10: 包一层 Prometheus middleware（counter + histogram）
+	rootHandler := metricsReg.FastHTTPMiddleware(r.Handler)
+
 	httpSrv := &fasthttp.Server{
-		Handler:            r.Handler,
+		Handler:            rootHandler,
 		Name:               "slink/" + version,
 		MaxRequestBodySize: maxRequestBodySize,
 		ReadTimeout:        10 * time.Second,
@@ -168,14 +192,18 @@ func run() error {
 	//   admin 数据不应跟生产流量同端口，避免被外网拉到 → 沿用 pprof 的本地绑定模型。
 	if cfg.PProfAddr != "" {
 		http.HandleFunc("/debug/stats", statsHandler(linkCache, eventBuf, generator, time.Now()))
+		// Day 10: Prometheus /metrics 挂同一个 admin 端口
+		http.Handle("/metrics", promhttp.HandlerFor(metricsReg.Registry, promhttp.HandlerOpts{
+			EnableOpenMetrics: true,
+		}))
 
 		pprofSrv := &http.Server{
 			Addr:              cfg.PProfAddr,
-			Handler:           http.DefaultServeMux, // pprof init() + /debug/stats
+			Handler:           http.DefaultServeMux, // pprof init() + /debug/stats + /metrics
 			ReadHeaderTimeout: 5 * time.Second,
 		}
 		go func() {
-			slog.Info("admin listening (pprof + /debug/stats)", "addr", cfg.PProfAddr)
+			slog.Info("admin listening (pprof + /debug/stats + /metrics)", "addr", cfg.PProfAddr)
 			if err := pprofSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				slog.Error("admin server", "err", err)
 			}

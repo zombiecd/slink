@@ -1,0 +1,18 @@
+# Grafana datasource 自动 provision（Day 10）
+#
+# Grafana 启动时自动加载这个文件，把 Prometheus 设成默认数据源。
+# 不用手动在 UI 里点。
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus  # 显式 uid，dashboard JSON 用此 uid 引用
+    access: proxy
+    # docker-compose 内部网络：prometheus 容器名 + 容器内端口 9090
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: "5s"
+    editable: false
