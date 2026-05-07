@@ -15,6 +15,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/zombiecd/slink/internal/cache"
+	"github.com/zombiecd/slink/internal/event"
 	"github.com/zombiecd/slink/internal/id"
 	"github.com/zombiecd/slink/internal/model"
 	"github.com/zombiecd/slink/internal/store"
@@ -28,8 +30,10 @@ import (
 // ────────────────────────────────────────────────────────────
 
 type harness struct {
-	pool *pgxpool.Pool
-	srv  *Server
+	pool      *pgxpool.Pool
+	srv       *Server
+	linkCache *cache.LinkCache
+	rdb       *cache.Client
 }
 
 func setupHarness(t *testing.T) *harness {
@@ -41,15 +45,31 @@ func setupHarness(t *testing.T) *harness {
 	if dsn == "" {
 		dsn = "postgres://slink:slink@localhost:15432/slink?sslmode=disable"
 	}
+	redisAddr := os.Getenv("SLINK_REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:16379"
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		t.Fatalf("connect: %v", err)
+		t.Fatalf("connect pg: %v", err)
 	}
 	links := store.NewLinkRepo(pool)
 	segs := store.NewSegmentRepo(pool)
+
+	rdb, err := cache.NewClient(ctx, cache.ClientConfig{Addr: redisAddr})
+	if err != nil {
+		pool.Close()
+		t.Fatalf("connect redis: %v (Redis 起着吗？)", err)
+	}
+	// 测试用极短 TTL（避免污染后续测试）
+	linkCache := cache.NewLinkCache(rdb,
+		cache.WithTTL(2*time.Second),
+		cache.WithMissingTTL(500*time.Millisecond),
+	)
 
 	// 用真实 biz_tag = "link" 避免不同 biz_tag 取到相同 ID
 	// （ID → code 是双射，相同 ID 必映射相同 code → unique 冲突）。
@@ -66,15 +86,19 @@ func setupHarness(t *testing.T) *harness {
 	}
 	gen := id.NewGenerator(buf)
 
-	srv := NewServer(Config{BaseURL: "http://test.local"}, gen, links)
+	srv := NewServer(
+		Config{BaseURL: "http://test.local"},
+		gen, links, linkCache, event.NopEventer{},
+	)
 	t.Cleanup(func() {
 		bg := context.Background()
 		var endMax int64
 		_ = pool.QueryRow(bg, "SELECT max_id FROM id_segment WHERE biz_tag = $1", bizTag).Scan(&endMax)
 		_, _ = pool.Exec(bg, "DELETE FROM links WHERE id > $1 AND id <= $2", startMax, endMax)
+		_ = rdb.Close()
 		pool.Close()
 	})
-	return &harness{pool: pool, srv: srv}
+	return &harness{pool: pool, srv: srv, linkCache: linkCache, rdb: rdb}
 }
 
 func (h *harness) post(t *testing.T, body string, headers map[string]string) *httptest.ResponseRecorder {

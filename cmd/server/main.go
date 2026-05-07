@@ -25,12 +25,13 @@ import (
 	"github.com/zombiecd/slink/internal/api"
 	"github.com/zombiecd/slink/internal/cache"
 	"github.com/zombiecd/slink/internal/config"
+	"github.com/zombiecd/slink/internal/event"
 	"github.com/zombiecd/slink/internal/id"
 	"github.com/zombiecd/slink/internal/store"
 )
 
 const (
-	version       = "v0.1-day4"
+	version       = "v0.1-day5"
 	shutdownGrace = 10 * time.Second
 )
 
@@ -94,16 +95,40 @@ func run() error {
 		"biz_tag", cfg.IDBizTag,
 		"step_size", cfg.IDStepSize)
 
-	// ── 5. 建 API server ──────────────────────────────────
+	// ── 5. 建 cache + 异步事件链路 ─────────────────────────
 	linkRepo := store.NewLinkRepo(pgPool)
-	apiSrv := api.NewServer(api.Config{BaseURL: cfg.BaseURL}, generator, linkRepo)
+	clickRepo := store.NewClickEventRepo(pgPool)
+	linkCache := cache.NewLinkCache(redisCli) // 默认 TTL 10min / missing 30s
 
-	// ── 6. 路由（健康检查 + API）──────────────────────────
+	eventBuf := event.NewBuffer(clickRepo, event.BufferConfig{
+		Capacity:      10_000,
+		BatchSize:     1000,
+		FlushInterval: time.Second,
+	})
+	eventBuf.Start()
+	slog.Info("event buffer started",
+		"capacity", 10_000, "batch_size", 1000, "flush_interval", "1s")
+
+	// ── 6. 建 API server ──────────────────────────────────
+	apiSrv := api.NewServer(
+		api.Config{BaseURL: cfg.BaseURL},
+		generator, linkRepo, linkCache, eventBuf,
+	)
+
+	// ── 7. 路由（健康检查 + API + 跳转）─────────────────
+	//
+	// 路由结构：
+	//   /healthz / /readyz  → 精确匹配，外层 mux 处理
+	//   /api/...            → 走 apiSrv.Routes() 内部匹配（POST /api/links 等）
+	//   /:code              → 走 apiSrv.Routes() 内部匹配（跳转）
+	//
+	// Go 1.22 ServeMux 优先级：精确匹配 > 通配前缀。
+	// 所以 "/" 兜底在 mux 里**不会**抢走 /healthz —— 它走专属精确路由。
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", livenessHandler)
 	mux.HandleFunc("/readyz", readinessHandler(pgPool, redisCli))
-	// 把 api 子路由挂到主 mux（Go 1.22+ ServeMux 嵌套）
-	mux.Handle("/api/", apiSrv.Routes())
+	// "/" 兜底：所有未被精确匹配的路径都进 apiSrv（含 /api/* 和 /:code）
+	mux.Handle("/", apiSrv.Routes())
 
 	httpSrv := &http.Server{
 		Addr:              cfg.Addr,
@@ -133,9 +158,19 @@ func run() error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
+
+	// 优雅停机顺序很重要：
+	//   1. HTTP server Shutdown：停接新连接 + 等已有请求完成
+	//   2. EventBuffer Stop：drain channel + 最后一次 flush
+	//   3. defer 链关闭 redisCli / pgPool（在 run() 顶部 defer）
+	// 反过来：先关 PG → buffer flush 时无 sink → 残余事件丢失
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		slog.Error("server shutdown", "err", err)
+		slog.Error("http server shutdown", "err", err)
 	}
+	if err := eventBuf.Stop(shutdownCtx); err != nil {
+		slog.Error("event buffer shutdown", "err", err)
+	}
+	slog.Info("event buffer stats", "stats", eventBuf.Stats())
 	slog.Info("bye")
 	return nil
 }
