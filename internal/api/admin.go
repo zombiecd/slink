@@ -33,11 +33,12 @@ type linkCacheStats struct {
 }
 
 type statsResp struct {
-	Version       string         `json:"version"`
-	UptimeSeconds int64          `json:"uptime_seconds"`
-	LinkCache     linkCacheStats `json:"link_cache"`
-	EventBuffer   event.Stats    `json:"event_buffer"`
-	IDGenerator   id.BufferStat  `json:"id_generator"`
+	Version       string             `json:"version"`
+	UptimeSeconds int64              `json:"uptime_seconds"`
+	LinkCache     linkCacheStats     `json:"link_cache"`
+	EventBuffer   *event.Stats       `json:"event_buffer,omitempty"`   // v0.4: 可空（kafka 单模式无 buffer）
+	KafkaProducer *event.KafkaStats  `json:"kafka_producer,omitempty"` // v0.4: 可空（buffer 单模式无 kafka）
+	IDGenerator   id.BufferStat      `json:"id_generator"`
 }
 
 // Stats 返回 admin /debug/stats 的 net/http handler。
@@ -45,10 +46,14 @@ type statsResp struct {
 // 用 net/http 而不是 fasthttp 是因为它挂在 admin :6060，
 // 该端口同时托管 net/http/pprof（标准库）和 prometheus client_golang
 // 的 promhttp.Handler，后两者都是 net/http 接口，统一栈更省事。
+//
+// v0.4：eb / kp 任一可为 nil（buffer/kafka/dual 三种装配组合，按 EventBackend 配置）。
+// 都为 nil 是配置 bug，render 时跳过对应字段。
 func Stats(
 	version string,
 	lc *cache.LinkCache,
 	eb *event.Buffer,
+	kp *event.KafkaProducer,
 	gen *id.Generator,
 	startTime time.Time,
 ) http.HandlerFunc {
@@ -69,8 +74,15 @@ func Stats(
 					HitRate: hitRate,
 				},
 			},
-			EventBuffer: eb.Stats(),
 			IDGenerator: gen.Stat(),
+		}
+		if eb != nil {
+			s := eb.Stats()
+			resp.EventBuffer = &s
+		}
+		if kp != nil {
+			s := kp.Stats()
+			resp.KafkaProducer = &s
 		}
 
 		w.Header().Set("Content-Type", "application/json")

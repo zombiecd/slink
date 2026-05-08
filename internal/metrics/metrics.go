@@ -185,6 +185,48 @@ func (r *Registry) BindEventBuffer(g EventBufferGetters) {
 	))
 }
 
+// KafkaProducerGetters 把 event.KafkaProducer 的 stats getter 打包。
+//
+// 4 个 counter 对应 KafkaStats 字段（决策稿 §6.4）：
+//   - sent_total：已交给 client buffer
+//   - acked_total：broker 已确认
+//   - dropped_total：100ms timeout drop（broker 不可达 / buffer 满）
+//   - errors_total：broker 错误（非超时）
+type KafkaProducerGetters struct {
+	Sent    func() float64
+	Acked   func() float64
+	Dropped func() float64
+	Errors  func() float64
+}
+
+// BindKafkaProducer 绑定 Kafka producer 全套 counter（4 个）。
+//
+// metric 命名遵循 Prometheus convention：
+//
+//	slink_kafka_producer_<name>_total
+func (r *Registry) BindKafkaProducer(g KafkaProducerGetters) {
+	for _, m := range []struct {
+		name string
+		help string
+		fn   func() float64
+	}{
+		{"sent_total", "Total events handed off to kgo client buffer.", g.Sent},
+		{"acked_total", "Total events acknowledged by broker.", g.Acked},
+		{"dropped_total", "Total events dropped (send timeout or shutdown).", g.Dropped},
+		{"errors_total", "Total non-timeout broker errors.", g.Errors},
+	} {
+		r.Registry.MustRegister(prometheus.NewCounterFunc(
+			prometheus.CounterOpts{
+				Namespace: Namespace,
+				Subsystem: "kafka_producer",
+				Name:      m.name,
+				Help:      m.help,
+			},
+			m.fn,
+		))
+	}
+}
+
 // BindIDGenerator 绑定 ID 号段使用率。
 func (r *Registry) BindIDGenerator(getUsage func() float64) {
 	r.Registry.MustRegister(prometheus.NewGaugeFunc(

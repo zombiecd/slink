@@ -228,5 +228,6 @@ func validBase() *Config {
 		EventBufferCapacity:      50000,
 		EventBufferBatchSize:     2000,
 		EventBufferFlushInterval: 500 * time.Millisecond,
+		EventBackend:             "buffer", // v0.4 默认（v0.3 行为）
 	}
 }

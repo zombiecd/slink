@@ -67,6 +67,24 @@ type Config struct {
 	EventBufferBatchSize     int           `env:"SLINK_EVENT_BUFFER_BATCH_SIZE"     envDefault:"2000"`
 	EventBufferFlushInterval time.Duration `env:"SLINK_EVENT_BUFFER_FLUSH_INTERVAL" envDefault:"500ms"`
 
+	// ── 事件后端选择（v0.4 灰度迁移用，决策稿 §8.3）─────
+	// 三档：
+	//   - buffer：v0.3 老路径（默认，不改 v0.3 行为）
+	//   - kafka：纯 Kafka producer（v0.4 切流后用）
+	//   - dual：DualWriter 包 Kafka + Buffer 双写（Day 14-15 灰度期用）
+	// 不允许其他值；Validate 严格校验。
+	EventBackend string `env:"SLINK_EVENT_BACKEND" envDefault:"buffer"`
+
+	// ── Kafka producer（v0.4，仅当 EventBackend != buffer 时必填）─────
+	// 决策稿 §5.3 参数 lz4 / linger 5ms / max in-flight 5 / acks=Leader 已固化在
+	// internal/event/kafka.go，不开放为 env 避免误调。
+	KafkaBrokersRaw       string        `env:"SLINK_KAFKA_BROKERS"        envDefault:""`
+	KafkaTopic            string        `env:"SLINK_KAFKA_TOPIC"          envDefault:"slink.click_events"`
+	KafkaSendTimeout      time.Duration `env:"SLINK_KAFKA_SEND_TIMEOUT"   envDefault:"100ms"`
+	KafkaMaxBufferedRecs  int           `env:"SLINK_KAFKA_MAX_BUFFERED"   envDefault:"100000"`
+	KafkaDeliveryTimeout  time.Duration `env:"SLINK_KAFKA_DELIVERY_TIMEOUT" envDefault:"5s"`
+	KafkaBrokers          []string      `env:"-"` // 由 Validate 解析
+
 	// ── 反向代理白名单（v0.3 H6 hardening）────────────────
 	// 仅当 RemoteAddr 落在这里面的 CIDR 时，才信任 X-Forwarded-For / X-Real-IP。
 	// 默认空 = 不信任 XFF（最安全），生产部署在 LB 后面时必须配置。
@@ -139,6 +157,9 @@ func (c *Config) Validate() error {
 	if c.EventBufferFlushInterval <= 0 {
 		return errors.New("EVENT_BUFFER_FLUSH_INTERVAL must be > 0")
 	}
+	if err := c.validateEventBackend(); err != nil {
+		return err
+	}
 	if err := c.validatePProfAddr(); err != nil {
 		return err
 	}
@@ -182,6 +203,69 @@ func parseTrustedProxies(raw string) ([]netip.Prefix, error) {
 		}
 		bits := addr.BitLen()
 		out = append(out, netip.PrefixFrom(addr, bits))
+	}
+	return out, nil
+}
+
+// validateEventBackend 校验 EventBackend 取值并解析 Kafka brokers。
+//
+// 规则：
+//   - buffer：v0.3 老路径，KafkaBrokers 不需要
+//   - kafka / dual：必须配 KafkaBrokers
+//   - 其他值：拒绝
+func (c *Config) validateEventBackend() error {
+	switch c.EventBackend {
+	case "buffer":
+		// v0.3 行为，无需 Kafka
+		return nil
+	case "kafka", "dual":
+		// 解析 brokers
+		brokers, err := parseKafkaBrokers(c.KafkaBrokersRaw)
+		if err != nil {
+			return fmt.Errorf("KAFKA_BROKERS: %w", err)
+		}
+		if len(brokers) == 0 {
+			return fmt.Errorf("EVENT_BACKEND=%q requires SLINK_KAFKA_BROKERS (comma-separated host:port)",
+				c.EventBackend)
+		}
+		c.KafkaBrokers = brokers
+		if c.KafkaTopic == "" {
+			return errors.New("KAFKA_TOPIC must not be empty")
+		}
+		if c.KafkaSendTimeout <= 0 {
+			return errors.New("KAFKA_SEND_TIMEOUT must be > 0")
+		}
+		if c.KafkaMaxBufferedRecs <= 0 {
+			return errors.New("KAFKA_MAX_BUFFERED must be > 0")
+		}
+		if c.KafkaDeliveryTimeout <= 0 {
+			return errors.New("KAFKA_DELIVERY_TIMEOUT must be > 0")
+		}
+		return nil
+	default:
+		return fmt.Errorf("EVENT_BACKEND=%q invalid; must be one of: buffer, kafka, dual",
+			c.EventBackend)
+	}
+}
+
+// parseKafkaBrokers 把 "host1:port,host2:port" 解析成 []string。
+// 空字符串返回 nil。
+func parseKafkaBrokers(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(p); err != nil {
+			return nil, fmt.Errorf("entry %q is not host:port: %w", p, err)
+		}
+		out = append(out, p)
 	}
 	return out, nil
 }
