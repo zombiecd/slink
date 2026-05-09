@@ -6,6 +6,8 @@
 /server
 # 仅忽略仓库根的 slink-* 二进制 / 包；不要写 slink-*（会误伤子目录如 configs/grafana/dashboards/slink-overview.json）
 /slink-*
+# 同理 spike build 产物（cmd/spike-* 子目录的 main.go 是源码，不会被忽略）
+/spike-*
 
 # Go 测试 / 覆盖率
 *.test
