@@ -3,6 +3,7 @@ package event
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -64,6 +65,20 @@ func makeBadRecord(payload string) *kgo.Record {
 	return &kgo.Record{
 		Key:   []byte("bad"),
 		Value: []byte(payload),
+		Topic: "slink.click_events",
+	}
+}
+
+// makeUnknownVersionRecord 构造合法 JSON 但 wire schema version 超出已知范围的 record。
+// consumer 应计 unknownVersion 而非 decodeErrors（A3 schema 演化预防）。
+func makeUnknownVersionRecord(version uint8) *kgo.Record {
+	body := fmt.Sprintf(
+		`{"v":%d,"event_id":"x","code":"x","ts_ms":1700000000000}`,
+		version,
+	)
+	return &kgo.Record{
+		Key:   []byte("unknownver"),
+		Value: []byte(body),
 		Topic: "slink.click_events",
 	}
 }
@@ -186,6 +201,83 @@ func TestConsumer_ProcessFetches_EmptyReturnsNotOk(t *testing.T) {
 	stats := c.Stats()
 	if stats.Polled != 0 || stats.Decoded != 0 {
 		t.Errorf("stats should be zero: %+v", stats)
+	}
+}
+
+func TestConsumer_ProcessFetches_UnknownVersionCountedSeparately(t *testing.T) {
+	c := newTestConsumer(&fakeSink{}, 10)
+
+	// 混合：1 条 v=1 正常 + 2 条 v=99 未知版本 + 1 条坏 JSON
+	fetches := fetchesFromRecords(
+		makeRecord(t, sampleEvent("good")),
+		makeUnknownVersionRecord(99),
+		makeUnknownVersionRecord(7),
+		makeBadRecord("not json"),
+	)
+
+	batch, ok := c.decodeFetches(fetches)
+	if !ok {
+		t.Fatal("expected ok=true (good record present)")
+	}
+	if len(batch) != 1 {
+		t.Errorf("batch len: got %d want 1 (only v=1 record)", len(batch))
+	}
+
+	stats := c.Stats()
+	if stats.Polled != 4 {
+		t.Errorf("Polled: got %d want 4", stats.Polled)
+	}
+	if stats.Decoded != 1 {
+		t.Errorf("Decoded: got %d want 1", stats.Decoded)
+	}
+	if stats.UnknownVersion != 2 {
+		t.Errorf("UnknownVersion: got %d want 2", stats.UnknownVersion)
+	}
+	if stats.DecodeErrors != 1 {
+		t.Errorf("DecodeErrors: got %d want 1 (only the bad-JSON record)", stats.DecodeErrors)
+	}
+}
+
+func TestDecodeClickEvent_VersionMatrix(t *testing.T) {
+	cases := []struct {
+		name        string
+		body        string
+		wantUnknown bool
+		wantDecErr  bool
+	}{
+		{
+			name: "v=0 omitted (Day 14-16 legacy producer)",
+			body: `{"event_id":"x","code":"x","ts_ms":1700000000000}`,
+		},
+		{
+			name: "v=1 current",
+			body: `{"v":1,"event_id":"x","code":"x","ts_ms":1700000000000}`,
+		},
+		{
+			name:        "v=2 unknown (producer ahead)",
+			body:        `{"v":2,"event_id":"x","code":"x","ts_ms":1700000000000}`,
+			wantUnknown: true,
+		},
+		{
+			name:       "garbage JSON",
+			body:       `not even json`,
+			wantDecErr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := decodeClickEvent([]byte(tc.body))
+			gotUnknown := errors.Is(err, ErrUnknownWireVersion)
+			gotDecErr := err != nil && !gotUnknown
+
+			if gotUnknown != tc.wantUnknown {
+				t.Errorf("unknown: got %v want %v (err=%v)", gotUnknown, tc.wantUnknown, err)
+			}
+			if gotDecErr != tc.wantDecErr {
+				t.Errorf("decode err: got %v want %v (err=%v)", gotDecErr, tc.wantDecErr, err)
+			}
+		})
 	}
 }
 

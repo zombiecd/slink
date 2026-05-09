@@ -134,23 +134,30 @@ func (r *Registry) BindLocalCache(getHits, getMisses func() float64) {
 
 // KafkaProducerGetters 把 event.KafkaProducer 的 stats getter 打包。
 //
-// 4 个 counter 对应 KafkaStats 字段（决策稿 §6.4）：
+// 4 个 counter + 1 个 gauge 对应 KafkaStats 字段：
 //   - sent_total：已交给 client buffer
 //   - acked_total：broker 已确认
 //   - dropped_total：100ms timeout drop（broker 不可达 / buffer 满）
 //   - errors_total：broker 错误（非超时）
+//   - healthy：最近 1s 内 cli.Ping 成功 (1) 或失败/未初始化 (0)
 type KafkaProducerGetters struct {
 	Sent    func() float64
 	Acked   func() float64
 	Dropped func() float64
 	Errors  func() float64
+	Healthy func() float64
 }
 
-// BindKafkaProducer 绑定 Kafka producer 全套 counter（4 个）。
+// BindKafkaProducer 绑定 Kafka producer 全套指标（4 counter + 1 gauge）。
 //
 // metric 命名遵循 Prometheus convention：
 //
-//	slink_kafka_producer_<name>_total
+//	slink_kafka_producer_<name>_total（counter）
+//	slink_kafka_producer_healthy（gauge：1=最近 ping 成功 / 0=失败）
+//
+// healthy gauge 用于 broker disconnect 1s 内告警，与 RecordDeliveryTimeout 解耦。
+// D5 故障演练观察：errors_total 要等 RecordDeliveryTimeout 后才以 100k 台阶飙升，
+// healthy 提前 ~5s 翻 0 让告警先于 errors 触发。
 func (r *Registry) BindKafkaProducer(g KafkaProducerGetters) {
 	for _, m := range []struct {
 		name string
@@ -172,27 +179,44 @@ func (r *Registry) BindKafkaProducer(g KafkaProducerGetters) {
 			m.fn,
 		))
 	}
+	r.Registry.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: "kafka_producer",
+			Name:      "healthy",
+			Help:      "1 if last broker ping succeeded within healthCheckInterval, 0 otherwise.",
+		},
+		g.Healthy,
+	))
 }
 
 // KafkaConsumerGetters 把 event.ClickEventConsumer 的 stats getter 打包。
 //
-// 5 个 counter 对应 ConsumerStats 字段（决策稿 §6.4 略调，spec 列了 processed_total
-// + errors_total + lag_seconds，本实现细化为 5 个：polled / decoded / inserted /
-// decode_errors / insert_errors，更利于排查 decode-vs-insert 哪段出问题。
-// lag_seconds 留 P5 故障演练后看是否值得加 — 当前用 inserted/sent 比例代偿）。
+// 6 个 counter + 1 个 gauge 对应 ConsumerStats 字段：
+//   - polled / decoded / inserted / decode_errors / insert_errors / unknown_version
+//   - lag_records (gauge)：admin API 5s 节奏拉取的真实 group lag
+//
+// 决策稿 §6.4 spec 列了 processed_total + errors_total + lag_seconds，本实现细化以
+// 便排查 decode-vs-insert-vs-version 哪段出问题。seconds 留 v0.5 视需要再加（需
+// producer 速率作除法）。
 type KafkaConsumerGetters struct {
-	Polled       func() float64
-	Decoded      func() float64
-	Inserted     func() float64
-	DecodeErrors func() float64
-	InsertErrors func() float64
+	Polled         func() float64
+	Decoded        func() float64
+	Inserted       func() float64
+	DecodeErrors   func() float64
+	InsertErrors   func() float64
+	UnknownVersion func() float64
+	LagRecords     func() float64
 }
 
-// BindKafkaConsumer 绑定 Kafka consumer 全套 counter（5 个）。
+// BindKafkaConsumer 绑定 Kafka consumer 全套指标（6 counter + 1 gauge）。
 //
 // metric 命名遵循 Prometheus convention：
 //
-//	slink_kafka_consumer_<name>_total
+//	slink_kafka_consumer_<name>_total（counter）
+//	slink_kafka_consumer_lag_records（gauge：当前 group 总 lag，-1=尚未首次成功拉取）
+//
+// lag_records gauge 取自 kadm.Client.Lag 周期 poll，与 fetch loop 独立 goroutine。
 func (r *Registry) BindKafkaConsumer(g KafkaConsumerGetters) {
 	for _, m := range []struct {
 		name string
@@ -204,6 +228,7 @@ func (r *Registry) BindKafkaConsumer(g KafkaConsumerGetters) {
 		{"inserted_total", "Total events written to PG via COPY FROM.", g.Inserted},
 		{"decode_errors_total", "Total JSON decode failures (poison records skipped).", g.DecodeErrors},
 		{"insert_errors_total", "Total BatchInsert failures (offset NOT committed).", g.InsertErrors},
+		{"unknown_version_total", "Total records with unknown wire schema version (producer ahead of consumer).", g.UnknownVersion},
 	} {
 		r.Registry.MustRegister(prometheus.NewCounterFunc(
 			prometheus.CounterOpts{
@@ -215,6 +240,15 @@ func (r *Registry) BindKafkaConsumer(g KafkaConsumerGetters) {
 			m.fn,
 		))
 	}
+	r.Registry.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: "kafka_consumer",
+			Name:      "lag_records",
+			Help:      "Current consumer group lag in records (latest_offset - committed_offset across partitions). -1 = not yet polled.",
+		},
+		g.LagRecords,
+	))
 }
 
 // BindIDGenerator 绑定 ID 号段使用率。

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -38,11 +39,17 @@ type ClickEventConsumer struct {
 	wg      sync.WaitGroup
 
 	// 计数器（atomic 读写）。语义见 ConsumerStats 注释。
-	polled       atomic.Int64
-	decoded      atomic.Int64
-	inserted     atomic.Int64
-	decodeErrors atomic.Int64
-	insertErrors atomic.Int64
+	polled         atomic.Int64
+	decoded        atomic.Int64
+	inserted       atomic.Int64
+	decodeErrors   atomic.Int64
+	insertErrors   atomic.Int64
+	unknownVersion atomic.Int64
+
+	// lagRecords 是 group 在所有 partition 上 (latest_offset - committed_offset) 之和。
+	// 由 runLagPoller goroutine 周期写入（默认 5s 一次），多读者无锁读。
+	// -1 表示尚未拿到首次结果或 admin call 失败（区别于真实的 lag=0）。
+	lagRecords atomic.Int64
 }
 
 // ConsumerConfig 是 ClickEventConsumer 的可选参数。零值取默认。
@@ -124,21 +131,31 @@ func NewClickEventConsumer(cfg ConsumerConfig, sink Sink) (*ClickEventConsumer, 
 		return nil, fmt.Errorf("kafka consumer: new client: %w", err)
 	}
 
-	return &ClickEventConsumer{
+	c := &ClickEventConsumer{
 		cli:  cli,
 		sink: sink,
 		cfg:  cfg,
 		done: make(chan struct{}),
-	}, nil
+	}
+	// 初始 -1 = 尚未首次成功 poll；区别于真实的 lag=0
+	c.lagRecords.Store(-1)
+	return c, nil
 }
 
-// Start 启动后台 poll + batch + flush 循环。重复调用是 no-op。
+// Start 启动后台 poll + batch + flush 循环 + lag poll。重复调用是 no-op。
+//
+// 启动两个 goroutine：
+//  1. run：消费主循环（poll → decode → batch → insert → commit）
+//  2. runLagPoller：admin API 周期查 group 真实 lag（A2 加，5s 节奏）
+//
+// 两者共享 done channel 和 wg；Stop 一并等待。
 func (c *ClickEventConsumer) Start() {
 	if !c.started.CompareAndSwap(false, true) {
 		return
 	}
-	c.wg.Add(1)
+	c.wg.Add(2)
 	go c.run()
+	go c.runLagPoller()
 }
 
 // Stop 优雅停机：
@@ -174,7 +191,7 @@ func (c *ClickEventConsumer) Stop(stopCtx context.Context) error {
 	}
 }
 
-// ConsumerStats 是 ClickEventConsumer 累计指标的快照。
+// ConsumerStats 是 ClickEventConsumer 累计指标 + 当前状态的快照。
 //
 // 字段语义：
 //   - Polled: PollFetches 拉到的 record 总数（含 decode 失败 + 重试）
@@ -182,25 +199,97 @@ func (c *ClickEventConsumer) Stop(stopCtx context.Context) error {
 //   - Inserted: BatchInsert 成功累积的 row 数（= 写到 PG 的事件数）
 //   - DecodeErrors: JSON 反序列化失败次数（坏消息）
 //   - InsertErrors: BatchInsert 失败次数（PG 抖动 / 主键冲突批量失败）
+//   - UnknownVersion: wire schema version 未知（producer 比 consumer 新）
+//   - LagRecords: group 在所有 partition 上的总 lag (latest_offset - committed_offset)
+//     -1 = 尚未首次成功 poll（区别于真实 lag=0）。由 runLagPoller 5s 周期写入。
 //
-// 健康指标：Polled - Decoded - DecodeErrors ≈ 0（所有 record 都被处理）
-// 异常信号：DecodeErrors > 0 表明 producer 侧 schema 或编码出问题
+// 健康指标：Polled - Decoded - DecodeErrors - UnknownVersion ≈ 0（所有 record 都被分类）
+// 异常信号：
+//   - DecodeErrors > 0 表明 producer 侧 schema 或编码出问题（坏 JSON）
+//   - UnknownVersion > 0 表明 producer 升版本但 consumer 没跟上（部署滞后），
+//     专门告警 → 提醒 ops 升级 consumer，不混进 DecodeErrors
+//   - LagRecords 持续上涨 = consumer 跟不上 producer，需扩 partition / 调批量参数
 type ConsumerStats struct {
-	Polled       int64 `json:"polled"`
-	Decoded      int64 `json:"decoded"`
-	Inserted     int64 `json:"inserted"`
-	DecodeErrors int64 `json:"decode_errors"`
-	InsertErrors int64 `json:"insert_errors"`
+	Polled         int64 `json:"polled"`
+	Decoded        int64 `json:"decoded"`
+	Inserted       int64 `json:"inserted"`
+	DecodeErrors   int64 `json:"decode_errors"`
+	InsertErrors   int64 `json:"insert_errors"`
+	UnknownVersion int64 `json:"unknown_version"`
+	LagRecords     int64 `json:"lag_records"`
 }
 
-// Stats 返回累计指标快照。所有字段是 atomic 单点读，跨字段非一致快照。
+// Stats 返回累计指标 + 当前状态快照。所有字段是 atomic 单点读，跨字段非一致快照。
 func (c *ClickEventConsumer) Stats() ConsumerStats {
 	return ConsumerStats{
-		Polled:       c.polled.Load(),
-		Decoded:      c.decoded.Load(),
-		Inserted:     c.inserted.Load(),
-		DecodeErrors: c.decodeErrors.Load(),
-		InsertErrors: c.insertErrors.Load(),
+		Polled:         c.polled.Load(),
+		Decoded:        c.decoded.Load(),
+		Inserted:       c.inserted.Load(),
+		DecodeErrors:   c.decodeErrors.Load(),
+		InsertErrors:   c.insertErrors.Load(),
+		UnknownVersion: c.unknownVersion.Load(),
+		LagRecords:     c.lagRecords.Load(),
+	}
+}
+
+// lagPollInterval / lagPollTimeout 固化（不暴露为参数，避免误调）：
+//   - Interval 5s：lag 不需要次秒级精度；admin API 是多请求过程，5s 给 broker 喘息
+//   - Timeout 2s：内部 multiple 请求 (DescribeGroups + ListOffsets)；2s 给慢网络余量
+const (
+	lagPollInterval = 5 * time.Second
+	lagPollTimeout  = 2 * time.Second
+)
+
+// runLagPoller 周期用 kadm.Client.Lag 查 consumer group 真实 lag。
+//
+// 设计点：
+//  1. 共享 c.cli（kgo client）— kadm 包仅发 admin 请求，不影响 fetch loop
+//  2. lag 失败保留上次值（不写 -1）— 临时网络抖动不让告警误响
+//  3. done 立即退出，不等下一个 tick
+//  4. 不阻断主循环：lag poll 在独立 goroutine
+//
+// 决策稿 §6.4 spec 列了 lag_seconds，本实现先暴露 lag_records（条数）。
+// records → seconds 需要 producer 速率作除法；先把基础指标接出来，
+// 告警阈值用 records/min 增长率即可。seconds 留 v0.5 看是否值得加。
+func (c *ClickEventConsumer) runLagPoller() {
+	defer c.wg.Done()
+	adm := kadm.NewClient(c.cli)
+	ticker := time.NewTicker(lagPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), lagPollTimeout)
+		lags, err := adm.Lag(ctx, c.cfg.GroupID)
+		cancel()
+
+		if err != nil {
+			slog.Warn("kafka consumer lag poll failed", "err", err, "group", c.cfg.GroupID)
+			continue
+		}
+
+		described, ok := lags[c.cfg.GroupID]
+		if !ok {
+			continue
+		}
+		// DescribeErr / FetchErr：group 没起来或 broker 不识别；不更新 lag
+		if described.DescribeErr != nil {
+			slog.Warn("kafka consumer lag describe error",
+				"err", described.DescribeErr, "group", c.cfg.GroupID)
+			continue
+		}
+		if described.FetchErr != nil {
+			slog.Warn("kafka consumer lag fetch error",
+				"err", described.FetchErr, "group", c.cfg.GroupID)
+			continue
+		}
+
+		c.lagRecords.Store(described.Lag.Total())
 	}
 }
 
@@ -306,9 +395,17 @@ func (c *ClickEventConsumer) decodeFetches(fetches kgo.Fetches) ([]ClickEvent, b
 		c.polled.Add(1)
 		evt, err := decodeClickEvent(rec.Value)
 		if err != nil {
-			c.decodeErrors.Add(1)
-			// 坏消息跳过 — 由后续成功 batch 的 commit 一并提交 offset
-			// （走到这里说明 JSON 反序列化失败；TS 字段缺失等会被 PG 校验拦下）
+			// 区分两类错误（A3：schema 演化预防）：
+			//   - ErrUnknownWireVersion：wire 解出但版本号未知（producer 比 consumer 新）
+			//     → unknownVersion++ 独立告警，提示 ops 升级 consumer
+			//   - 其他：JSON 解析失败（坏消息 / 投毒）
+			//     → decodeErrors++
+			// 两类都跳过当前 record，commit 由后续成功 batch 一并提交 offset。
+			if errors.Is(err, ErrUnknownWireVersion) {
+				c.unknownVersion.Add(1)
+			} else {
+				c.decodeErrors.Add(1)
+			}
 			return
 		}
 		c.decoded.Add(1)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,12 +37,18 @@ type KafkaProducer struct {
 	// 这样 caller cancel 不影响已交给 client buffer 的 record 投递。
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
+	wg       sync.WaitGroup // 等 healthcheck goroutine 在 Close 前退出
 
 	// 计数器（atomic 读写）。语义见 Stats 注释。
 	sent    atomic.Int64
 	acked   atomic.Int64
 	dropped atomic.Int64
 	errors  atomic.Int64
+
+	// healthy 反映最近一次 cli.Ping 结果。true=最近 ping 成功，false=失败或未 ping 过。
+	// 由 healthcheck goroutine 周期写入，多读者无锁读（atomic.Bool）。
+	// 主路径（Enqueue）不读 healthy — 不阻断跳转，仅作 observability 信号。
+	healthy atomic.Bool
 }
 
 // KafkaConfig 是 KafkaProducer 的可选参数。零值取默认。
@@ -117,13 +124,70 @@ func NewKafkaProducer(cfg KafkaConfig) (*KafkaProducer, error) {
 	}
 
 	bgCtx, bgCancel := context.WithCancel(context.Background())
-	return &KafkaProducer{
+	p := &KafkaProducer{
 		cli:      cli,
 		topic:    cfg.Topic,
 		cfg:      cfg,
 		bgCtx:    bgCtx,
 		bgCancel: bgCancel,
-	}, nil
+	}
+	// 初始 healthy=true：避免启动后 1s 内 healthcheck 还没跑就被判 unhealthy。
+	// 真实健康由首次 ping 在 healthCheckInterval 内修正。
+	p.healthy.Store(true)
+	p.wg.Add(1)
+	go p.runHealthCheck()
+	return p, nil
+}
+
+// healthCheckInterval / healthCheckTimeout 固化为决策稿 §5.3 同档：
+//   - Interval 1s：D5 故障演练观察 broker disconnect 5s 才报错的根因是
+//     RecordDeliveryTimeout，但即使把它缩短，主路径仍依赖"主动健康信号"才能立即翻
+//     metric 翻 0；1s 是上限。
+//   - Timeout 500ms：ping 是 broker-only Metadata，正常 < 50ms 返回；500ms 给慢
+//     网络足够余量，但不会拖累下一次 ping。
+const (
+	healthCheckInterval = 1 * time.Second
+	healthCheckTimeout  = 500 * time.Millisecond
+)
+
+// runHealthCheck 周期性 cli.Ping，把结果写到 p.healthy。
+//
+// 设计点：
+//  1. ping 失败 → healthy.Store(false) + slog.Warn（broker 失联感知 ≤ 1s）
+//  2. ping 成功 → healthy.Store(true)（自愈感知 ≤ 1s）
+//  3. bgCtx done 立即退出（Close 触发）
+//  4. 不影响主路径：Enqueue 永不读 healthy，只通过 metric/Stats 暴露
+//
+// D5 故障演练背景（Day 16）：Round 1 stop kafka 15s 期间 producer.errors 在 ~5s 之
+// 后才以 100k 整数台阶飙升 — 这是 RecordDeliveryTimeout 5s 后 callback 才触发。
+// 加 healthy 后告警可以 1s 内识别 broker disconnect，与 RecordDeliveryTimeout 解耦。
+func (p *KafkaProducer) runHealthCheck() {
+	defer p.wg.Done()
+	ticker := time.NewTicker(healthCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.bgCtx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		pingCtx, cancel := context.WithTimeout(p.bgCtx, healthCheckTimeout)
+		err := p.cli.Ping(pingCtx)
+		cancel()
+
+		if err != nil {
+			// 仅在状态翻转时打日志，避免 broker 持续失联时刷屏。
+			if p.healthy.Swap(false) {
+				slog.Warn("kafka producer healthcheck: broker unreachable", "err", err)
+			}
+			continue
+		}
+		if !p.healthy.Swap(true) {
+			slog.Info("kafka producer healthcheck: broker recovered")
+		}
+	}
 }
 
 // Enqueue 把 ClickEvent 异步投递到 Kafka。
@@ -182,17 +246,20 @@ func (p *KafkaProducer) handleAck(err error) {
 	slog.Warn("kafka producer ack error", "err", err)
 }
 
-// Close 优雅关闭 producer：停接新 Enqueue + Flush 在飞 record。
+// Close 优雅关闭 producer：停接新 Enqueue + Flush 在飞 record + 等 healthcheck 退出。
 //
 // stopCtx 控 Flush 的最大耗时。建议 5-10s（同 buffer.Stop）。
 //
 // 调用顺序（main.go 优雅停机）：
 //  1. fasthttp.Server.ShutdownWithContext（停接新请求）
-//  2. KafkaProducer.Close（Flush 在飞 record，类比 Buffer.Stop）
+//  2. KafkaProducer.Close（Flush 在飞 record + healthcheck 退出）
 //  3. defer 关 client / DB（main 顶部 defer）
 func (p *KafkaProducer) Close(stopCtx context.Context) error {
-	// 标记 bgCtx done — 后续 Enqueue 调用立即 dropped
+	// 标记 bgCtx done — 后续 Enqueue 立即 dropped；healthcheck goroutine 也由此退出
 	p.bgCancel()
+
+	// 等 healthcheck goroutine 退出，避免 cli.Close 后还有 Ping 调用
+	p.wg.Wait()
 
 	// Flush 等待 client buffer 中 record 全部 ack（或 stopCtx 超时）
 	if err := p.cli.Flush(stopCtx); err != nil {
@@ -210,14 +277,18 @@ func (p *KafkaProducer) Close(stopCtx context.Context) error {
 //   - Acked: callback 拿到 nil err（broker 已确认）
 //   - Dropped: 主路径 100ms timeout 或停机后被丢
 //   - Errors: broker 错误（网络 / 元数据 / 编码失败等）
+//   - Healthy: 最近一次 healthcheck Ping 成功（由 runHealthCheck 周期写入，1s 节奏）
 //
 // 健康指标：(Sent - Acked - Dropped - Errors) ≈ in-flight，应稳定在 client buffer 容量内。
-// 异常信号：Dropped / Sent 比例 > 1% 表明 broker 处理不过来或挂了。
+// 异常信号：
+//   - Healthy=false 持续 > 1s：broker 失联，告警立即触发（不需等 RecordDeliveryTimeout）
+//   - Dropped / Sent 比例 > 1%：broker 处理不过来或挂了（被动信号）
 type KafkaStats struct {
 	Sent    int64 `json:"sent"`
 	Acked   int64 `json:"acked"`
 	Dropped int64 `json:"dropped"`
 	Errors  int64 `json:"errors"`
+	Healthy bool  `json:"healthy"`
 }
 
 // Stats 返回累计指标快照。所有字段是 atomic 单点读，跨字段非一致快照。
@@ -227,14 +298,34 @@ func (p *KafkaProducer) Stats() KafkaStats {
 		Acked:   p.acked.Load(),
 		Dropped: p.dropped.Load(),
 		Errors:  p.errors.Load(),
+		Healthy: p.healthy.Load(),
 	}
 }
+
+// CurrentWireVersion 是 producer 当前编码使用的 schema 版本。
+//
+// 演化规则（v0.4 Day 17 起立）：
+//   - 加可选字段（向后兼容） → 不升 version
+//   - 改字段含义 / 删字段 / 加必填字段 → 升 version；老 consumer 看到新 version 走 unknown 计数不阻断
+//   - 切编码格式（JSON → proto） → 升 version + 走 magic byte 在外层区分（不只靠 wire 内字段）
+//
+// Day 13 spike 旧 schema 不兼容血泪教训：当时 topic 残留旧格式 record，新 consumer
+// decode 失败一律计 decodeErrors，分不清是"坏消息"还是"新代码不识别旧消息"。
+// 加 version 后两类问题分开：JSON 解析失败 → decodeErrors；JSON 解出但 version
+// 未知 → unknownVersion，可独立告警。
+const CurrentWireVersion uint8 = 1
 
 // clickEventWire 是 ClickEvent 在 Kafka 上的 JSON 编码格式。
 //
 // schema 演化原则：所有字段加 omitempty，consumer 用宽松解码。
 // v0.4 起 JSON，v0.5 看性能要不要切 protobuf（决策稿 §6.2）。
+//
+// 字段 V（schema_version）：
+//   - omitempty 让 v=0 时不编入 JSON，向后兼容 Day 14-16 producer 写入的无版本消息
+//     （decode 默认 0 → 视作 v0 兼容路径，字段集与 v1 相同）
+//   - 当前 producer 写 V=CurrentWireVersion=1
 type clickEventWire struct {
+	V         uint8  `json:"v,omitempty"` // schema version，见 CurrentWireVersion
 	EventID   string `json:"event_id"`
 	Code      string `json:"code"`
 	IP        string `json:"ip,omitempty"`
@@ -247,6 +338,7 @@ type clickEventWire struct {
 
 func encodeClickEvent(evt ClickEvent) ([]byte, error) {
 	wire := clickEventWire{
+		V:         CurrentWireVersion,
 		EventID:   evt.EventID,
 		Code:      evt.Code,
 		UserAgent: evt.UserAgent,
@@ -261,14 +353,30 @@ func encodeClickEvent(evt ClickEvent) ([]byte, error) {
 	return json.Marshal(&wire)
 }
 
+// ErrUnknownWireVersion 在 decode 拿到 wire 但 V 字段超出已知版本范围时返回。
+//
+// 与普通 decode 失败（坏 JSON）区分：consumer 见到这个错误说明 producer 端 schema
+// 比当前 consumer 新。应独立告警 + 计数（不混进 decodeErrors），不阻断 commit。
+var ErrUnknownWireVersion = errors.New("kafka: unknown wire schema version")
+
 // decodeClickEvent 是 consumer 侧反编码。
 //
 // Day 15 起被 ClickEventConsumer 使用。与 encodeClickEvent 共享 clickEventWire，
 // schema 演化时只改一处。
+//
+// 返回 ErrUnknownWireVersion 表示 wire 解出但版本号未知；其他 error 是 JSON 失败。
+// 调用方应区分两类错误分别计数（见 ConsumerStats.UnknownVersion）。
 func decodeClickEvent(body []byte) (ClickEvent, error) {
 	var wire clickEventWire
 	if err := json.Unmarshal(body, &wire); err != nil {
 		return ClickEvent{}, fmt.Errorf("kafka: decode: %w", err)
+	}
+	// V==0：Day 14-16 旧 producer 无版本号 record，按 v0 兼容路径解（字段集与 v1 同）
+	// V==1：当前格式
+	// V>1：未知（producer 比 consumer 新），返回 ErrUnknownWireVersion 让 caller 计数
+	if wire.V > CurrentWireVersion {
+		return ClickEvent{}, fmt.Errorf("%w: got v=%d, support v<=%d",
+			ErrUnknownWireVersion, wire.V, CurrentWireVersion)
 	}
 	evt := ClickEvent{
 		EventID:   wire.EventID,

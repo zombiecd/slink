@@ -315,6 +315,12 @@ func newKafkaAndBind(
 		Acked:   func() float64 { return float64(kp.Stats().Acked) },
 		Dropped: func() float64 { return float64(kp.Stats().Dropped) },
 		Errors:  func() float64 { return float64(kp.Stats().Errors) },
+		Healthy: func() float64 {
+			if kp.Stats().Healthy {
+				return 1
+			}
+			return 0
+		},
 	})
 	return kp, nil
 }

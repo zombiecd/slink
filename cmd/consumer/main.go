@@ -148,11 +148,13 @@ func run() error {
 	// ── Prometheus metrics ─────────────────────────────────────────
 	metricsReg := metrics.New()
 	metricsReg.BindKafkaConsumer(metrics.KafkaConsumerGetters{
-		Polled:       func() float64 { return float64(consumer.Stats().Polled) },
-		Decoded:      func() float64 { return float64(consumer.Stats().Decoded) },
-		Inserted:     func() float64 { return float64(consumer.Stats().Inserted) },
-		DecodeErrors: func() float64 { return float64(consumer.Stats().DecodeErrors) },
-		InsertErrors: func() float64 { return float64(consumer.Stats().InsertErrors) },
+		Polled:         func() float64 { return float64(consumer.Stats().Polled) },
+		Decoded:        func() float64 { return float64(consumer.Stats().Decoded) },
+		Inserted:       func() float64 { return float64(consumer.Stats().Inserted) },
+		DecodeErrors:   func() float64 { return float64(consumer.Stats().DecodeErrors) },
+		InsertErrors:   func() float64 { return float64(consumer.Stats().InsertErrors) },
+		UnknownVersion: func() float64 { return float64(consumer.Stats().UnknownVersion) },
+		LagRecords:     func() float64 { return float64(consumer.Stats().LagRecords) },
 	})
 
 	// ── HTTP admin（/metrics + /healthz + /debug/stats JSON）─────
@@ -168,8 +170,8 @@ func run() error {
 		s := consumer.Stats()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w,
-			`{"polled":%d,"decoded":%d,"inserted":%d,"decode_errors":%d,"insert_errors":%d}`,
-			s.Polled, s.Decoded, s.Inserted, s.DecodeErrors, s.InsertErrors,
+			`{"polled":%d,"decoded":%d,"inserted":%d,"decode_errors":%d,"insert_errors":%d,"unknown_version":%d,"lag_records":%d}`,
+			s.Polled, s.Decoded, s.Inserted, s.DecodeErrors, s.InsertErrors, s.UnknownVersion, s.LagRecords,
 		)
 	})
 
