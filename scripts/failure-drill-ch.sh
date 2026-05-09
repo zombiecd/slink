@@ -23,6 +23,7 @@
 set -euo pipefail
 
 ADDR="${SLINK_ADDR:-http://localhost:18080}"
+SERVER_ADMIN_ADDR="${SERVER_ADMIN_ADDR:-http://127.0.0.1:6060}"  # PProf + /debug/stats + /metrics
 CONSUMER_ADDR="${CONSUMER_ADDR:-http://localhost:18081}"
 DURATION="${BENCH_DURATION:-60s}"
 THREADS="${BENCH_THREADS:-4}"
@@ -75,6 +76,7 @@ preflight() {
     fi
   done
   curl -sf --noproxy '*' "${ADDR}/healthz" > /dev/null || { fail "server $ADDR not healthy"; exit 3; }
+  curl -sf --noproxy '*' "${SERVER_ADMIN_ADDR}/debug/stats" > /dev/null || { fail "server admin $SERVER_ADMIN_ADDR not healthy"; exit 3; }
   curl -sf --noproxy '*' "${CONSUMER_ADDR}/healthz" > /dev/null || { fail "consumer $CONSUMER_ADDR not healthy"; exit 3; }
   [ -s "$CODES_FILE" ] || { fail "codes file $CODES_FILE empty (run scripts/bench/run.sh first to seed)"; exit 3; }
   info "preflight ok"
@@ -126,7 +128,7 @@ sample_loop() {
   while [ "$(date +%s)" -lt "$end_ts" ]; do
     local now p_json c_json p_sent p_acked p_dropped p_errors p_healthy c_inserted c_insert_err c_lag ch_rows ch_lag
     now=$(date +%s)
-    p_json=$(curl -sf --max-time 1 --noproxy '*' "${ADDR}/debug/stats" 2>/dev/null || echo '{}')
+    p_json=$(curl -sf --max-time 1 --noproxy '*' "${SERVER_ADMIN_ADDR}/debug/stats" 2>/dev/null || echo '{}')
     c_json=$(curl -sf --max-time 1 --noproxy '*' "${CONSUMER_ADDR}/debug/stats" 2>/dev/null || echo '{}')
     p_sent=$(echo "$p_json" | python3 -c 'import json,sys;d=json.load(sys.stdin).get("kafka_producer",{});print(d.get("sent",0))' 2>/dev/null || echo 0)
     p_acked=$(echo "$p_json" | python3 -c 'import json,sys;d=json.load(sys.stdin).get("kafka_producer",{});print(d.get("acked",0))' 2>/dev/null || echo 0)
