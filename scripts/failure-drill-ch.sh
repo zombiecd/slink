@@ -83,14 +83,25 @@ preflight() {
 }
 
 # ── baseline reset（每轮独立） ───────────────────────────────────
+# Day 22 P3 修复：移除 kafka-topics --delete + --create
+#
+# 原因：kgo client（cmd/consumer）在 topic delete 后进入永久错误状态，CREATE
+# 后未自动重新 join group，PG 落地链路死。CH Kafka Engine 不受影响（自带
+# reconnect）。Day 22 P3 第一次跑时撞这个 bug：PG 表 count=0 / CH 5.99M /
+# Go consumer.lag_records=5.19M 卡死。详见 docs/bench/day-22-p3-failure-drill-a.md §4.
+#
+# 修复：只 TRUNCATE PG/CH 主表，不动 topic / 不动 consumer group offset。
+# - PG 主表 truncate 后从 0 起，consumer 从 last commit offset 继续消费新事件
+# - CH 主表 truncate 后从 0 起，CH Kafka Engine 的 group offset 不受影响
+# - broker 上的旧数据仍在 retention 期内，但已被 consumer commit，不会重消费
+#
+# 副作用：每轮 baseline 不是 broker LEO=0 的"全新"环境。使用 FROM/TO 时间窗口
+# 过滤 recon 即可区分前后轮事件（recon-fixture.sh 已支持）。
 reset_baseline() {
   local round="$1"
   bold "═══ Reset baseline for Round ${round}"
   do_run "docker exec ${PG_CONTAINER} psql -U ${PG_USER} -d ${PG_DB} -c 'TRUNCATE click_events;'"
   do_run "docker exec ${CH_CONTAINER} clickhouse-client --user ${CH_USER} --password ${CH_PASSWORD} -d ${CH_DB} --query 'TRUNCATE TABLE click_events_ch'"
-  # kafka topic 重建（清 offset）
-  do_run "docker exec ${KAFKA_CONTAINER} /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --delete --topic slink.click_events --if-exists"
-  do_run "docker exec ${KAFKA_CONTAINER} /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --topic slink.click_events --partitions 4 --replication-factor 1"
   sleep 2
 }
 
