@@ -135,14 +135,13 @@ func run() error {
 		func() float64 { return float64(linkCache.LocalStats().Misses) },
 	)
 
-	// ── v0.4: 按 EventBackend 装配事件后端 ────────────────
-	// 三档（决策稿 §8.3）：
-	//   - buffer：v0.3 老路径（默认）
-	//   - kafka：纯 KafkaProducer（v0.4 切流后）
-	//   - dual：DualWriter 双写（Day 14-15 灰度期）
+	// ── v0.4 Day 16 切流后：单 Kafka backend ────────────────
+	// buffer/dual 模式已删除（git tag v0.3-buffer-final 留代码考古）。
+	// EventBackend 字段保留接受 "kafka" 单值，给 v0.5 加新 backend 留扩展点。
 	//
-	// eventBuf / kafkaProducer 至少一个非 nil；nil 的部分 admin /debug/stats 自动跳过。
-	eventBuf, kafkaProducer, eventer, err := buildEventBackend(cfg, clickRepo, metricsReg)
+	// clickRepo 这里没用上 — Day 16 切流后主表写入由 cmd/consumer 负责，server 只投 Kafka。
+	_ = clickRepo
+	kafkaProducer, eventer, err := buildEventBackend(cfg, metricsReg)
 	if err != nil {
 		return err
 	}
@@ -199,7 +198,7 @@ func run() error {
 	// /debug/stats（Day 9 新增）也挂这个 admin 端口：
 	//   admin 数据不应跟生产流量同端口，避免被外网拉到 → 沿用 pprof 的本地绑定模型。
 	if cfg.PProfAddr != "" {
-		http.HandleFunc("/debug/stats", api.Stats(version, linkCache, eventBuf, kafkaProducer, generator, time.Now()))
+		http.HandleFunc("/debug/stats", api.Stats(version, linkCache, kafkaProducer, generator, time.Now()))
 		// Day 10: Prometheus /metrics 挂同一个 admin 端口
 		http.Handle("/metrics", promhttp.HandlerFor(metricsReg.Registry, promhttp.HandlerOpts{
 			EnableOpenMetrics: true,
@@ -246,12 +245,10 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
 
-	// 优雅停机顺序（v0.4 更新）：
+	// 优雅停机顺序（v0.4 Day 16 切流后）：
 	//   1. fasthttp.Server ShutdownWithContext：停接新连接 + 等已有请求完成
-	//   2. KafkaProducer Close：Flush 在飞 record（dual / kafka 模式才有）
-	//   3. EventBuffer Stop：drain channel + 最后一次 flush（buffer / dual 模式才有）
-	//   4. defer 链关闭 redisCli / pgPool
-	// 反过来：先关 PG → buffer flush 时无 sink → 残余事件丢失
+	//   2. KafkaProducer Close：Flush 在飞 record
+	//   3. defer 链关闭 redisCli / pgPool
 	if err := httpSrv.ShutdownWithContext(shutdownCtx); err != nil {
 		slog.Error("http server shutdown", "err", err)
 	}
@@ -261,86 +258,34 @@ func run() error {
 		}
 		slog.Info("kafka producer stats", "stats", kafkaProducer.Stats())
 	}
-	if eventBuf != nil {
-		if err := eventBuf.Stop(shutdownCtx); err != nil {
-			slog.Error("event buffer shutdown", "err", err)
-		}
-		slog.Info("event buffer stats", "stats", eventBuf.Stats())
-	}
 	slog.Info("bye")
 	return nil
 }
 
-// buildEventBackend 按 cfg.EventBackend 三档装配事件后端 + 注册 Prometheus metrics。
+// buildEventBackend 装配事件后端 + 注册 Prometheus metrics。
 //
-// 返回三个值：
-//   - eventBuf：buffer / dual 模式时非 nil（admin /debug/stats 用）
-//   - kafkaProducer：kafka / dual 模式时非 nil（admin /debug/stats + 优雅停机用）
-//   - eventer：装到 api.Server 的 Eventer 接口；handler 不区分底层
+// v0.4 Day 16 切流后只剩 kafka 单档（buffer / dual 模式已删，
+// 代码考古见 git tag v0.3-buffer-final）。EventBackend 字段保留是给
+// v0.5 加新 backend（如 ClickHouse direct）留 switch 扩展位。
 //
-// 如果新增 backend，在 switch 加 case；config.validateEventBackend 同步加。
+// 返回：
+//   - kafkaProducer：admin /debug/stats + 优雅停机 close 用
+//   - eventer：装到 api.Server 的 Eventer 接口
 func buildEventBackend(
 	cfg *config.Config,
-	clickRepo *store.ClickEventRepo,
 	metricsReg *metrics.Registry,
-) (*event.Buffer, *event.KafkaProducer, event.Eventer, error) {
+) (*event.KafkaProducer, event.Eventer, error) {
 	switch cfg.EventBackend {
-	case "buffer":
-		eb := newBufferAndBind(cfg, clickRepo, metricsReg)
-		return eb, nil, eb, nil
-
 	case "kafka":
 		kp, err := newKafkaAndBind(cfg, metricsReg)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
-		return nil, kp, kp, nil
-
-	case "dual":
-		// primary = Kafka（v0.4 待验证），secondary = Buffer（v0.3 兜底）
-		// 决策稿 §8.1：Kafka 失败仍要 Buffer 写，反之亦然
-		eb := newBufferAndBind(cfg, clickRepo, metricsReg)
-		kp, err := newKafkaAndBind(cfg, metricsReg)
-		if err != nil {
-			// Kafka 起不来：dual 模式无法满足，直接报错（不能默默退化成 buffer）
-			_ = eb.Stop(context.Background())
-			return nil, nil, nil, fmt.Errorf("dual mode: kafka init failed: %w", err)
-		}
-		dw := event.NewDualWriter(kp, eb)
-		slog.Info("event backend = dual (kafka primary + buffer secondary)")
-		return eb, kp, dw, nil
+		return kp, kp, nil
 
 	default:
-		return nil, nil, nil, fmt.Errorf("unknown EventBackend %q", cfg.EventBackend)
+		return nil, nil, fmt.Errorf("unknown EventBackend %q (only \"kafka\" supported after Day 16 cutover)", cfg.EventBackend)
 	}
-}
-
-// newBufferAndBind 构造 Buffer + 启动 + Prometheus 绑定。
-func newBufferAndBind(
-	cfg *config.Config,
-	clickRepo *store.ClickEventRepo,
-	metricsReg *metrics.Registry,
-) *event.Buffer {
-	eb := event.NewBuffer(clickRepo, event.BufferConfig{
-		Capacity:      cfg.EventBufferCapacity,
-		BatchSize:     cfg.EventBufferBatchSize,
-		FlushInterval: cfg.EventBufferFlushInterval,
-	})
-	eb.Start()
-	slog.Info("event buffer started",
-		"capacity", cfg.EventBufferCapacity,
-		"batch_size", cfg.EventBufferBatchSize,
-		"flush_interval", cfg.EventBufferFlushInterval)
-
-	metricsReg.BindEventBuffer(metrics.EventBufferGetters{
-		Enqueued: func() float64 { return float64(eb.Stats().Enqueued) },
-		Dropped:  func() float64 { return float64(eb.Stats().Dropped) },
-		Flushed:  func() float64 { return float64(eb.Stats().Flushed) },
-		FlushErr: func() float64 { return float64(eb.Stats().FlushErr) },
-		Used:     func() float64 { return float64(eb.Stats().Used) },
-		Capacity: func() float64 { return float64(eb.Stats().Capacity) },
-	})
-	return eb
 }
 
 // newKafkaAndBind 构造 KafkaProducer + Prometheus 绑定（不启动 — kgo client 创建即连）。

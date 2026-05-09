@@ -1,14 +1,49 @@
 package event
 
 import (
+	"context"
 	"errors"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 )
+
+// fakeSink 是 consumer 测试专用 sink，记录每次 BatchInsert 的 batch。
+//
+// Day 16 切流前住在 buffer_test.go（被 buffer 单测复用）。Day 16 删 buffer.go
+// 后挪到这里 — 仍然是测试-only 类型，不进生产代码。
+type fakeSink struct {
+	mu       sync.Mutex
+	batches  [][]ClickEvent
+	failNext atomic.Bool // 设为 true 时下一次 BatchInsert 返回错误
+}
+
+func (f *fakeSink) BatchInsert(ctx context.Context, evts []ClickEvent) error {
+	if f.failNext.Swap(false) {
+		return errors.New("simulated flush failure")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := make([]ClickEvent, len(evts))
+	copy(cp, evts)
+	f.batches = append(f.batches, cp)
+	return nil
+}
+
+func (f *fakeSink) totalRows() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, b := range f.batches {
+		n += len(b)
+	}
+	return n
+}
 
 // makeRecord 把 ClickEvent encode 成 *kgo.Record（复用 producer 编码路径）。
 func makeRecord(t *testing.T, evt ClickEvent) *kgo.Record {

@@ -1,7 +1,6 @@
 package metrics
 
 import (
-	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -52,50 +51,6 @@ func TestBindLocalCache(t *testing.T) {
 	}
 	if got["misses"] != 3 {
 		t.Errorf("misses_total = %v, want 3", got["misses"])
-	}
-}
-
-func TestBindEventBuffer(t *testing.T) {
-	r := New()
-	r.BindEventBuffer(EventBufferGetters{
-		Enqueued: func() float64 { return 100 },
-		Dropped:  func() float64 { return 5 },
-		Flushed:  func() float64 { return 95 },
-		FlushErr: func() float64 { return 0 },
-		Used:     func() float64 { return 42 },
-		Capacity: func() float64 { return 50000 },
-	})
-
-	gathered, err := r.Registry.Gather()
-	if err != nil {
-		t.Fatalf("Gather: %v", err)
-	}
-
-	want := map[string]float64{
-		"slink_event_buffer_enqueued_total":  100,
-		"slink_event_buffer_dropped_total":   5,
-		"slink_event_buffer_flushed_total":   95,
-		"slink_event_buffer_flush_err_total": 0,
-		"slink_event_buffer_used":            42,
-		"slink_event_buffer_capacity":        50000,
-	}
-	for _, mf := range gathered {
-		if !strings.HasPrefix(*mf.Name, "slink_event_buffer_") {
-			continue
-		}
-		exp, ok := want[*mf.Name]
-		if !ok {
-			continue
-		}
-		var v float64
-		if mf.Metric[0].Counter != nil {
-			v = *mf.Metric[0].Counter.Value
-		} else if mf.Metric[0].Gauge != nil {
-			v = *mf.Metric[0].Gauge.Value
-		}
-		if v != exp {
-			t.Errorf("%s = %v, want %v", *mf.Name, v, exp)
-		}
 	}
 }
 

@@ -60,22 +60,12 @@ type Config struct {
 	LocalCacheSize int           `env:"SLINK_LOCAL_CACHE_SIZE" envDefault:"4096"`
 	LocalCacheTTL  time.Duration `env:"SLINK_LOCAL_CACHE_TTL"  envDefault:"1m"`
 
-	// ── 异步事件 buffer（Day 9 调优）─────────────────────
-	// Day 8 实测 93k RPS 把 10k/1k/1s 的默认值打爆（63% 丢）。
-	// 调到 50k/2k/500ms 后 dropped 趋零，内存约 5MB（5w × 100B/event）。
-	EventBufferCapacity      int           `env:"SLINK_EVENT_BUFFER_CAPACITY"       envDefault:"50000"`
-	EventBufferBatchSize     int           `env:"SLINK_EVENT_BUFFER_BATCH_SIZE"     envDefault:"2000"`
-	EventBufferFlushInterval time.Duration `env:"SLINK_EVENT_BUFFER_FLUSH_INTERVAL" envDefault:"500ms"`
+	// ── 事件后端选择（v0.4 Day 16 切流后只剩 kafka 单档）─────
+	// 历史：buffer / dual 模式已删（git tag v0.3-buffer-final 留代码考古）。
+	// 字段保留是给 v0.5 加新 backend（如 ClickHouse direct）留 switch 扩展位。
+	EventBackend string `env:"SLINK_EVENT_BACKEND" envDefault:"kafka"`
 
-	// ── 事件后端选择（v0.4 灰度迁移用，决策稿 §8.3）─────
-	// 三档：
-	//   - buffer：v0.3 老路径（默认，不改 v0.3 行为）
-	//   - kafka：纯 Kafka producer（v0.4 切流后用）
-	//   - dual：DualWriter 包 Kafka + Buffer 双写（Day 14-15 灰度期用）
-	// 不允许其他值；Validate 严格校验。
-	EventBackend string `env:"SLINK_EVENT_BACKEND" envDefault:"buffer"`
-
-	// ── Kafka producer（v0.4，仅当 EventBackend != buffer 时必填）─────
+	// ── Kafka producer（v0.4 必填）─────
 	// 决策稿 §5.3 参数 lz4 / linger 5ms / max in-flight 5 / acks=Leader 已固化在
 	// internal/event/kafka.go，不开放为 env 避免误调。
 	KafkaBrokersRaw       string        `env:"SLINK_KAFKA_BROKERS"        envDefault:""`
@@ -144,19 +134,6 @@ func (c *Config) Validate() error {
 	if _, err := url.Parse(c.BaseURL); err != nil {
 		return fmt.Errorf("BASE_URL is not a valid URL: %w", err)
 	}
-	if c.EventBufferCapacity <= 0 {
-		return errors.New("EVENT_BUFFER_CAPACITY must be > 0")
-	}
-	if c.EventBufferBatchSize <= 0 {
-		return errors.New("EVENT_BUFFER_BATCH_SIZE must be > 0")
-	}
-	if c.EventBufferBatchSize > c.EventBufferCapacity {
-		return fmt.Errorf("EVENT_BUFFER_BATCH_SIZE (%d) cannot exceed EVENT_BUFFER_CAPACITY (%d)",
-			c.EventBufferBatchSize, c.EventBufferCapacity)
-	}
-	if c.EventBufferFlushInterval <= 0 {
-		return errors.New("EVENT_BUFFER_FLUSH_INTERVAL must be > 0")
-	}
 	if err := c.validateEventBackend(); err != nil {
 		return err
 	}
@@ -209,16 +186,12 @@ func parseTrustedProxies(raw string) ([]netip.Prefix, error) {
 
 // validateEventBackend 校验 EventBackend 取值并解析 Kafka brokers。
 //
-// 规则：
-//   - buffer：v0.3 老路径，KafkaBrokers 不需要
-//   - kafka / dual：必须配 KafkaBrokers
-//   - 其他值：拒绝
+// v0.4 Day 16 切流后 EventBackend 只接受 "kafka" 单值。
+// buffer / dual 模式代码已删（git tag v0.3-buffer-final）。
+// 字段保留是给 v0.5 加新 backend（如 ClickHouse direct）留 switch 扩展位。
 func (c *Config) validateEventBackend() error {
 	switch c.EventBackend {
-	case "buffer":
-		// v0.3 行为，无需 Kafka
-		return nil
-	case "kafka", "dual":
+	case "kafka":
 		// 解析 brokers
 		brokers, err := parseKafkaBrokers(c.KafkaBrokersRaw)
 		if err != nil {
@@ -243,7 +216,7 @@ func (c *Config) validateEventBackend() error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("EVENT_BACKEND=%q invalid; must be one of: buffer, kafka, dual",
+		return fmt.Errorf("EVENT_BACKEND=%q invalid; only \"kafka\" supported after Day 16 cutover (buffer/dual removed, see git tag v0.3-buffer-final)",
 			c.EventBackend)
 	}
 }

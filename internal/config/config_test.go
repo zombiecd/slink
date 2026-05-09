@@ -15,9 +15,11 @@ func setEnv(t *testing.T, kv map[string]string) {
 }
 
 func TestLoad_Defaults(t *testing.T) {
-	// 必填项最少给一个，其他全走默认
+	// 必填项最少给：PG_DSN + KAFKA_BROKERS（v0.4 Day 16 切流后 EventBackend
+	// 默认 kafka，要 brokers）。其他全走默认。
 	setEnv(t, map[string]string{
-		"SLINK_PG_DSN": "postgres://test:test@localhost/test",
+		"SLINK_PG_DSN":         "postgres://test:test@localhost/test",
+		"SLINK_KAFKA_BROKERS":  "localhost:19092",
 	})
 
 	cfg, err := Load()
@@ -41,7 +43,7 @@ func TestLoad_Defaults(t *testing.T) {
 		{"IDBizTag", cfg.IDBizTag, "link"},
 		{"LocalCacheSize", cfg.LocalCacheSize, 4096},
 		{"LocalCacheTTL", cfg.LocalCacheTTL, time.Minute},
-		{"EventBufferCapacity", cfg.EventBufferCapacity, 50000},
+		{"EventBackend", cfg.EventBackend, "kafka"},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -66,6 +68,7 @@ func TestLoad_RequiredMissing(t *testing.T) {
 func TestLoad_EnvOverridesDefault(t *testing.T) {
 	setEnv(t, map[string]string{
 		"SLINK_PG_DSN":            "postgres://x:y@h/db",
+		"SLINK_KAFKA_BROKERS":     "localhost:19092",
 		"SLINK_ADDR":              ":9090",
 		"SLINK_PG_MAX_CONNS":      "50",
 		"SLINK_LOCAL_CACHE_TTL":   "5m",
@@ -99,10 +102,8 @@ func TestValidate_Errors(t *testing.T) {
 		{"min > max conns", func(c *Config) { c.PGMinConns = 30 }, "PG_MIN_CONNS"},
 		{"max conns 0", func(c *Config) { c.PGMaxConns = 0 }, "PG_MAX_CONNS"},
 		{"step size 0", func(c *Config) { c.IDStepSize = 0 }, "ID_STEP_SIZE"},
-		{"event buf capacity 0", func(c *Config) { c.EventBufferCapacity = 0 }, "EVENT_BUFFER_CAPACITY"},
-		{"event batch > capacity", func(c *Config) {
-			c.EventBufferBatchSize = 100000
-		}, "EVENT_BUFFER_BATCH_SIZE"},
+		{"unknown event backend", func(c *Config) { c.EventBackend = "buffer" }, "EVENT_BACKEND"},
+		{"kafka but no brokers", func(c *Config) { c.KafkaBrokersRaw = "" }, "KAFKA_BROKERS"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -213,21 +214,23 @@ func TestValidate_TrustedProxies(t *testing.T) {
 // validBase 返回一个通过校验的基础 Config，用于负向测试 mutate。
 func validBase() *Config {
 	return &Config{
-		Addr:                     ":18080",
-		BaseURL:                  "http://localhost:18080",
-		LogLevel:                 "info",
-		Env:                      "dev",
-		PGDSN:                    "postgres://x:y@h/db",
-		PGMaxConns:               20,
-		PGMinConns:               2,
-		RedisAddr:                "localhost:16379",
-		IDStepSize:               1000,
-		IDBizTag:                 "link",
-		LocalCacheSize:           4096,
-		LocalCacheTTL:            time.Minute,
-		EventBufferCapacity:      50000,
-		EventBufferBatchSize:     2000,
-		EventBufferFlushInterval: 500 * time.Millisecond,
-		EventBackend:             "buffer", // v0.4 默认（v0.3 行为）
+		Addr:                  ":18080",
+		BaseURL:               "http://localhost:18080",
+		LogLevel:              "info",
+		Env:                   "dev",
+		PGDSN:                 "postgres://x:y@h/db",
+		PGMaxConns:            20,
+		PGMinConns:            2,
+		RedisAddr:             "localhost:16379",
+		IDStepSize:            1000,
+		IDBizTag:              "link",
+		LocalCacheSize:        4096,
+		LocalCacheTTL:         time.Minute,
+		EventBackend:          "kafka", // v0.4 Day 16 切流后唯一 backend
+		KafkaBrokersRaw:       "localhost:19092",
+		KafkaTopic:            "slink.click_events",
+		KafkaSendTimeout:      100 * time.Millisecond,
+		KafkaMaxBufferedRecs:  100000,
+		KafkaDeliveryTimeout:  5 * time.Second,
 	}
 }

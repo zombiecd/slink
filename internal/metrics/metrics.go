@@ -132,59 +132,6 @@ func (r *Registry) BindLocalCache(getHits, getMisses func() float64) {
 	))
 }
 
-// EventBufferGetters 把 event.Buffer 的各 stats getter 打包，避免参数列表过长。
-type EventBufferGetters struct {
-	Enqueued func() float64
-	Dropped  func() float64
-	Flushed  func() float64
-	FlushErr func() float64
-	Used     func() float64
-	Capacity func() float64
-}
-
-// BindEventBuffer 绑定 event buffer 全套指标（4 counter + 2 gauge）。
-func (r *Registry) BindEventBuffer(g EventBufferGetters) {
-	for _, m := range []struct {
-		name string
-		help string
-		fn   func() float64
-	}{
-		{"enqueued_total", "Total events successfully enqueued.", g.Enqueued},
-		{"dropped_total", "Total events dropped due to buffer full or stop.", g.Dropped},
-		{"flushed_total", "Total events flushed to sink (PG batch insert).", g.Flushed},
-		{"flush_err_total", "Total flush failures.", g.FlushErr},
-	} {
-		r.Registry.MustRegister(prometheus.NewCounterFunc(
-			prometheus.CounterOpts{
-				Namespace: Namespace,
-				Subsystem: "event_buffer",
-				Name:      m.name,
-				Help:      m.help,
-			},
-			m.fn,
-		))
-	}
-
-	r.Registry.MustRegister(prometheus.NewGaugeFunc(
-		prometheus.GaugeOpts{
-			Namespace: Namespace,
-			Subsystem: "event_buffer",
-			Name:      "used",
-			Help:      "Current number of events in buffer (channel length).",
-		},
-		g.Used,
-	))
-	r.Registry.MustRegister(prometheus.NewGaugeFunc(
-		prometheus.GaugeOpts{
-			Namespace: Namespace,
-			Subsystem: "event_buffer",
-			Name:      "capacity",
-			Help:      "Configured buffer capacity (channel cap).",
-		},
-		g.Capacity,
-	))
-}
-
 // KafkaProducerGetters 把 event.KafkaProducer 的 stats getter 打包。
 //
 // 4 个 counter 对应 KafkaStats 字段（决策稿 §6.4）：

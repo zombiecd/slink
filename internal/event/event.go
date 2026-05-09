@@ -1,14 +1,13 @@
 // Package event 处理 slink 的异步事件链路。
 //
-// v0.1 链路：
+// v0.4 链路（Day 16 切流后）：
 //
-//	api/redirect.go  ──Enqueue──▶  Buffer (channel)
-//	                                  │
-//	                                  ▼ flush（1s 或 1000 条）
-//	                            store.ClickEventRepo.BatchInsert
+//	api/redirect.go  ──Enqueue──▶  KafkaProducer ──▶ Kafka topic
+//	                                                       │
+//	                                                       ▼ poll batch + COPY FROM
+//	                                                ClickEventConsumer ──▶ store.ClickEventRepo
 //
-// v0.2 计划：把 channel 换成 Kafka producer，store 入库改为 consumer。
-// 上层 API 看到的 Eventer 接口不变。
+// v0.3 老路径（channel buffer）已在 Day 16 删除。代码考古见 git tag v0.3-buffer-final。
 package event
 
 import (
@@ -32,18 +31,26 @@ type ClickEvent struct {
 	TS        time.Time // 跳转发生时间（服务端记录）
 }
 
-// Eventer 是异步事件投递的契约。
+// Eventer 是异步事件投递的契约（producer 侧）。
 //
 // 接口足够小：只暴露 Enqueue。
-// 这样 api 层依赖接口，buffer 实现可独立演进（单实例 channel → Kafka producer）。
+// 这样 api 层依赖接口，实现可独立演进（v0.3 channel buffer → v0.4 KafkaProducer）。
 type Eventer interface {
 	// Enqueue 投递一个事件到异步队列。
 	//
 	// 必须满足：
-	//   - 不阻塞跳转主链路（要么瞬间入 channel，要么超时直接丢）
+	//   - 不阻塞跳转主链路（要么瞬间入队，要么超时直接丢）
 	//   - 上层不关心成功/失败：返回 error 仅供日志/指标用
-	//   - 实现侧应内部统计丢弃数（buffer 满），通过 metrics 暴露
+	//   - 实现侧应内部统计丢弃数，通过 metrics 暴露
 	Enqueue(ctx context.Context, evt ClickEvent) error
+}
+
+// Sink 是异步事件下游写库的契约（consumer 侧）。
+//
+// v0.4 由 store.ClickEventRepo 实现（PG COPY FROM）。
+// ClickEventConsumer 拿一个 Sink，poll 拿到的 batch 走 BatchInsert 写到下游表。
+type Sink interface {
+	BatchInsert(ctx context.Context, events []ClickEvent) error
 }
 
 // NopEventer 是空实现，本地测试 / 关闭事件采集时用。
