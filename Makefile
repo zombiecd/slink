@@ -1,7 +1,8 @@
 .PHONY: help up down logs ps migrate migrate-down psql redis-cli \
         run build test bench cover lint tidy clean fmt vet \
         kafka-cli kafka-topics kafka-bootstrap \
-        run-consumer build-consumer
+        run-consumer build-consumer \
+        spike-up spike-init spike-v2 spike-ch spike-kafka-fixture spike-counts spike-down
 
 # 默认 PG DSN（覆盖：make migrate PG_DSN=...）
 PG_DSN ?= postgres://slink:slink@localhost:15432/slink?sslmode=disable
@@ -136,3 +137,65 @@ tidy:
 clean:
 	rm -rf bin coverage.out coverage.html
 	go clean -testcache
+
+# ── v0.5 Day 18: ClickHouse spike（库选型 + 写入模式）──────
+# 决策依据：docs/architecture/v0.5-clickhouse.md §4
+# 三组 spike 同口径（5M 上限 / 30s 时间窗 / batch=1000 / 同 fixture 池）：
+#   1. spike-v2          : clickhouse-go/v2 PrepareBatch（高级）
+#   2. spike-ch          : ch-go proto.Col* 列容器复用（low-level Native）
+#   3. spike-kafka-engine: CH ENGINE=Kafka + MaterializedView（端到端）
+SPIKE_DB ?= slink
+SPIKE_PASS ?= slink
+SPIKE_DBNAME ?= slink_analytics
+SPIKE_CH_HOST ?= localhost
+SPIKE_CH_NATIVE_PORT ?= 19000
+SPIKE_KAFKA_HOST ?= localhost
+SPIKE_KAFKA_PORT ?= 19092
+
+spike-up:
+	@echo "→ starting kafka + clickhouse only (not full stack)"
+	docker compose up -d kafka clickhouse
+	@echo "→ waiting kafka + clickhouse healthy (max 60s)"
+	@for i in $$(seq 1 30); do \
+		k=$$(docker compose ps --status running -q kafka | wc -l | tr -d ' '); \
+		c=$$(docker compose ps --status running -q clickhouse | wc -l | tr -d ' '); \
+		if [ "$$k" = "1" ] && [ "$$c" = "1" ]; then \
+			ch_ok=$$(docker compose exec -T clickhouse wget -q -O - http://127.0.0.1:8123/ping 2>/dev/null | grep -c Ok); \
+			kf_ok=$$(docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 && echo 1 || echo 0); \
+			if [ "$$ch_ok" -ge 1 ] && [ "$$kf_ok" = "1" ]; then \
+				echo "✓ both healthy in ~$$((i*2))s"; exit 0; \
+			fi; \
+		fi; \
+		sleep 2; \
+	done; \
+	echo "✗ timeout"; exit 1
+
+spike-init:
+	@echo "→ apply migrations/clickhouse/0001 (主表 + skip index)"
+	docker compose exec -T clickhouse clickhouse-client --user $(SPIKE_DB) --password $(SPIKE_PASS) -d $(SPIKE_DBNAME) --multiquery < migrations/clickhouse/0001_click_events_ch.up.sql
+	@echo "→ apply migrations/clickhouse/0002 (Kafka Engine spike 三表)"
+	docker compose exec -T clickhouse clickhouse-client --user $(SPIKE_DB) --password $(SPIKE_PASS) -d $(SPIKE_DBNAME) --multiquery < migrations/clickhouse/0002_kafka_engine_spike.up.sql
+	@$(MAKE) kafka-bootstrap
+	@echo "✓ spike init done"
+
+spike-v2:
+	@echo "→ spike-clickhouse-v2 (clickhouse-go/v2 PrepareBatch)"
+	go run ./cmd/spike-clickhouse-v2 -addr $(SPIKE_CH_HOST):$(SPIKE_CH_NATIVE_PORT) -user $(SPIKE_DB) -pass $(SPIKE_PASS) -db $(SPIKE_DBNAME)
+
+spike-ch:
+	@echo "→ spike-ch-go (ch-go proto.Col* low-level Native)"
+	go run ./cmd/spike-ch-go -addr $(SPIKE_CH_HOST):$(SPIKE_CH_NATIVE_PORT) -user $(SPIKE_DB) -pass $(SPIKE_PASS) -db $(SPIKE_DBNAME)
+
+spike-kafka-fixture:
+	@echo "→ spike-kafka-fixture (kgo producer → Kafka topic)"
+	go run ./cmd/spike-kafka-fixture -brokers $(SPIKE_KAFKA_HOST):$(SPIKE_KAFKA_PORT) -topic slink.click_events
+
+spike-counts:
+	@docker compose exec -T clickhouse clickhouse-client --user $(SPIKE_DB) --password $(SPIKE_PASS) -d $(SPIKE_DBNAME) -q "\
+		SELECT 'click_events_ch_spike (v2/ch)' AS t, count() FROM click_events_ch_spike \
+		UNION ALL \
+		SELECT 'click_events_ch_kafka_target (kafka engine)' AS t, count() FROM click_events_ch_kafka_target"
+
+spike-down:
+	@echo "→ stop kafka + clickhouse (volume 保留)"
+	docker compose stop kafka clickhouse
