@@ -21,6 +21,16 @@ scrape_configs:
           service: slink
           env: dev
 
+  # v0.4 Day 15: Kafka consumer 独立 binary，单独 admin 端口 :18081
+  - job_name: slink-consumer
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - host.docker.internal:18081
+        labels:
+          service: slink-consumer
+          env: dev
+
   # Prometheus 自己的指标（运维 Prometheus 本身用）
   - job_name: prometheus
     static_configs:

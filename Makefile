@@ -1,6 +1,7 @@
 .PHONY: help up down logs ps migrate migrate-down psql redis-cli \
         run build test bench cover lint tidy clean fmt vet \
-        kafka-cli kafka-topics kafka-bootstrap
+        kafka-cli kafka-topics kafka-bootstrap \
+        run-consumer build-consumer
 
 # 默认 PG DSN（覆盖：make migrate PG_DSN=...）
 PG_DSN ?= postgres://slink:slink@localhost:15432/slink?sslmode=disable
@@ -20,8 +21,10 @@ help:
 	@echo "  kafka-topics     列出所有 topic"
 	@echo "  kafka-bootstrap  创建 slink.click_events topic (4 partitions)"
 	@echo ""
-	@echo "  run         本地启动 slink 服务"
-	@echo "  build       编译 binary 到 ./bin/slink"
+	@echo "  run            本地启动 slink server"
+	@echo "  run-consumer   本地启动 slink consumer (v0.4 Day 15+)"
+	@echo "  build          编译 server 到 ./bin/slink"
+	@echo "  build-consumer 编译 consumer 到 ./bin/slink-consumer"
 	@echo "  test        跑所有单元测试"
 	@echo "  bench       跑 benchmark"
 	@echo "  cover       生成覆盖率报告"
@@ -95,6 +98,16 @@ build:
 	@mkdir -p bin
 	go build -o bin/slink ./cmd/server
 	@echo "✓ built bin/slink"
+
+# ── v0.4 Day 15: Kafka consumer 独立 binary ──────────────
+run-consumer:
+	@if [ ! -f .env ]; then echo "→ creating .env from .env.example"; cp .env.example .env; fi
+	go run ./cmd/consumer
+
+build-consumer:
+	@mkdir -p bin
+	go build -o bin/slink-consumer ./cmd/consumer
+	@echo "✓ built bin/slink-consumer"
 
 test:
 	go test -race -count=1 ./...

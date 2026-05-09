@@ -227,6 +227,49 @@ func (r *Registry) BindKafkaProducer(g KafkaProducerGetters) {
 	}
 }
 
+// KafkaConsumerGetters 把 event.ClickEventConsumer 的 stats getter 打包。
+//
+// 5 个 counter 对应 ConsumerStats 字段（决策稿 §6.4 略调，spec 列了 processed_total
+// + errors_total + lag_seconds，本实现细化为 5 个：polled / decoded / inserted /
+// decode_errors / insert_errors，更利于排查 decode-vs-insert 哪段出问题。
+// lag_seconds 留 P5 故障演练后看是否值得加 — 当前用 inserted/sent 比例代偿）。
+type KafkaConsumerGetters struct {
+	Polled       func() float64
+	Decoded      func() float64
+	Inserted     func() float64
+	DecodeErrors func() float64
+	InsertErrors func() float64
+}
+
+// BindKafkaConsumer 绑定 Kafka consumer 全套 counter（5 个）。
+//
+// metric 命名遵循 Prometheus convention：
+//
+//	slink_kafka_consumer_<name>_total
+func (r *Registry) BindKafkaConsumer(g KafkaConsumerGetters) {
+	for _, m := range []struct {
+		name string
+		help string
+		fn   func() float64
+	}{
+		{"polled_total", "Total records polled from Kafka topic.", g.Polled},
+		{"decoded_total", "Total records successfully JSON-decoded.", g.Decoded},
+		{"inserted_total", "Total events written to PG via COPY FROM.", g.Inserted},
+		{"decode_errors_total", "Total JSON decode failures (poison records skipped).", g.DecodeErrors},
+		{"insert_errors_total", "Total BatchInsert failures (offset NOT committed).", g.InsertErrors},
+	} {
+		r.Registry.MustRegister(prometheus.NewCounterFunc(
+			prometheus.CounterOpts{
+				Namespace: Namespace,
+				Subsystem: "kafka_consumer",
+				Name:      m.name,
+				Help:      m.help,
+			},
+			m.fn,
+		))
+	}
+}
+
 // BindIDGenerator 绑定 ID 号段使用率。
 func (r *Registry) BindIDGenerator(getUsage func() float64) {
 	r.Registry.MustRegister(prometheus.NewGaugeFunc(

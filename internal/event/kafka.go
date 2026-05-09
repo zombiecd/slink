@@ -261,11 +261,10 @@ func encodeClickEvent(evt ClickEvent) ([]byte, error) {
 	return json.Marshal(&wire)
 }
 
-// decodeClickEvent 是 consumer 侧反编码（v0.5 用，留给本包内可见）。
+// decodeClickEvent 是 consumer 侧反编码。
 //
-// 不在 v0.4 范围内被调用，但放这里方便 consumer 复用同一个 wire 结构。
-//
-//nolint:unused // v0.5 consumer 用
+// Day 15 起被 ClickEventConsumer 使用。与 encodeClickEvent 共享 clickEventWire，
+// schema 演化时只改一处。
 func decodeClickEvent(body []byte) (ClickEvent, error) {
 	var wire clickEventWire
 	if err := json.Unmarshal(body, &wire); err != nil {
@@ -288,5 +287,5 @@ func decodeClickEvent(body []byte) (ClickEvent, error) {
 
 // ErrKafkaTimeout 不再返回（callback 内部统计），保留为文档锚点。
 //
-//nolint:unused // 设计参考
+//nolint:unused // 文档锚点
 var ErrKafkaTimeout = errors.New("kafka: send timeout (record buffer full or broker unreachable)")

@@ -11,16 +11,32 @@ import (
 	"github.com/zombiecd/slink/internal/event"
 )
 
-// ClickEventRepo 是点击事件分区表 click_events 的写入器。
+// ClickEventRepo 是点击事件分区表的写入器。
 //
 // 仅暴露 BatchInsert：单条 INSERT 在 v0.1 高 QPS 跳转下会成为瓶颈
 // （n 次 RTT、n 次 commit）。1000 条/次的 COPY FROM 比 1000 次 INSERT 快 10x+。
+//
+// table 字段控制目标表名：
+//   - v0.3 主路径写主表 click_events（NewClickEventRepo 默认）
+//   - v0.4 Day 15 影子期 consumer 写 click_events_shadow（NewClickEventRepoForTable）
+//
+// 镜像表 schema 必须严格对齐，否则 COPY FROM 会因列序/列数失败。
 type ClickEventRepo struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	table string
 }
 
+// NewClickEventRepo 写主表 click_events（v0.3 默认行为）。
 func NewClickEventRepo(pool *pgxpool.Pool) *ClickEventRepo {
-	return &ClickEventRepo{pool: pool}
+	return &ClickEventRepo{pool: pool, table: "click_events"}
+}
+
+// NewClickEventRepoForTable 写指定表（v0.4 影子表用）。
+//
+// table 由调用方控制，**不接 SQL 注入风险**：consumer 侧表名是编译期常量，
+// 不来自用户输入。pgx CopyFrom 用 pgx.Identifier 自动 quote。
+func NewClickEventRepoForTable(pool *pgxpool.Pool, table string) *ClickEventRepo {
+	return &ClickEventRepo{pool: pool, table: table}
 }
 
 // BatchInsert 用 PG COPY FROM 批量写入点击事件。
@@ -66,16 +82,16 @@ func (r *ClickEventRepo) BatchInsert(ctx context.Context, events []event.ClickEv
 
 	n, err := r.pool.CopyFrom(
 		ctx,
-		pgx.Identifier{"click_events"},
+		pgx.Identifier{r.table},
 		[]string{"event_id", "code", "ip", "user_agent", "referer", "country", "region", "ts"},
 		pgx.CopyFromRows(rows),
 	)
 	if err != nil {
-		return fmt.Errorf("copy click_events (%d rows): %w", len(events), err)
+		return fmt.Errorf("copy %s (%d rows): %w", r.table, len(events), err)
 	}
 	if int(n) != len(events) {
 		// COPY FROM 应当全成功或全失败；这条分支理论不该走到
-		return fmt.Errorf("copy click_events partial: wrote %d of %d", n, len(events))
+		return fmt.Errorf("copy %s partial: wrote %d of %d", r.table, n, len(events))
 	}
 	return nil
 }
