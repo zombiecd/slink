@@ -10,7 +10,7 @@ spec:
   # Phase 1 = 1 副本验证镜像 + 后端连通性
   # Phase 2 = 解决三连锁后扩到 3
   # Day 27 Phase 2 P1：scale=2 验证跨 Pod L1 一致性
-  replicas: 2
+  replicas: 3
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -84,17 +84,19 @@ spec:
             - name: SLINK_LOCAL_CACHE_TTL
               value: "1m"
 
-            # ── Kafka ──（host :19092）
+            # ── Kafka ──（Day 28 修：走 EXTERNAL_K8S listener，advertised = host.docker.internal:19093）
+            # 原 :19092 advertised localhost:19092，Pod 内 localhost ≠ host 导致 acked=0
             - name: SLINK_EVENT_BACKEND
               value: "kafka"
             - name: SLINK_KAFKA_BROKERS
-              value: "kafka:19092"
+              value: "kafka:19093"
             - name: SLINK_KAFKA_TOPIC
               value: "slink.click_events"
+            # Day 21 调到 500ms：100ms 在 docker network 高 RPS 下大量 send timeout（Day 20-21 复盘）
             - name: SLINK_KAFKA_SEND_TIMEOUT
-              value: "100ms"
+              value: "500ms"
             - name: SLINK_KAFKA_MAX_BUFFERED
-              value: "100000"
+              value: "200000"
             - name: SLINK_KAFKA_DELIVERY_TIMEOUT
               value: "5s"
 

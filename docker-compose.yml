@@ -107,7 +107,12 @@ services:
   # 决策依据：docs/architecture/v0.4-kafka.md §3 (Kafka 削峰 click_event)
   # 镜像：apache/kafka 官方（bitnami 免费 tag 在 2025-08 后下线）
   # KRaft 模式：单容器既当 controller 又当 broker，省 zookeeper 一节点
-  # 双 listener：INTERNAL 给容器互通 (kafka:9092)；EXTERNAL 给 host (localhost:19092)
+  # 三 listener（Day 28 修：v0.6 K8s Pod 路径走 EXTERNAL_K8S）：
+  #   INTERNAL     给 docker-compose 内部容器（kafka-ui / Kafka Engine）→ kafka:9092
+  #   EXTERNAL     给 host 上 cmd/consumer / 测试脚本 → localhost:19092
+  #   EXTERNAL_K8S 给 K8s Pod（ExternalName: kafka → host.docker.internal:19093）
+  # 原因：advertised 给 client 的回连地址必须是 client 视角可达。
+  #       Pod 内 localhost ≠ host，必须告诉 Pod 走 host.docker.internal。
   kafka:
     image: apache/kafka:3.9.2
     container_name: slink-kafka
@@ -115,14 +120,16 @@ services:
     ports:
       # 主机端口偏移，避开默认 9092
       - "19092:19092"
+      # Day 28 K8s 专用 listener
+      - "19093:19093"
     environment:
       # KRaft 单节点：controller + broker 同进程
       KAFKA_NODE_ID: "1"
       KAFKA_PROCESS_ROLES: "controller,broker"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
-      KAFKA_LISTENERS: "INTERNAL://:9092,EXTERNAL://:19092,CONTROLLER://:9093"
-      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:19092"
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_LISTENERS: "INTERNAL://:9092,EXTERNAL://:19092,EXTERNAL_K8S://:19093,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:19092,EXTERNAL_K8S://host.docker.internal:19093"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,EXTERNAL_K8S:PLAINTEXT"
       KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
       # 单节点开发：副本因子 1 / min.insync 1（生产必须 ≥3 / ≥2）
