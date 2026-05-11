@@ -12,11 +12,13 @@
 --   2. click_events_ch_main_mv      MaterializedView     ← SELECT FROM kafka 表 + 类型转换 → 主表 click_events_ch
 --   3. click_events_ch (0001 已建)  ENGINE = MergeTree   ← 数据落地（v0.5 §3 模块图标的「列存分析源」）
 --
--- 设置参数（v0.5 §4 封板）：
---   kafka_num_consumers = 2          → topic 4 partition / 2 consumer 各占 2
---   kafka_max_block_size = 1000      → 对齐 Go consumer BatchSize=1000
+-- 设置参数（Day 23 P1 调优后，原值见 git history）：
+--   kafka_num_consumers = 4          → 一 partition 一 consumer（topic 4 partition），消除串行处理瓶颈
+--   kafka_max_block_size = 500       → 比默认 1000 更敏锐 flush，配合 stream_flush_interval_ms=2000 组合追平加速
 --   kafka_skip_broken_messages = 0   → 不跳坏消息（坏消息进 system.kafka_consumers）
 --   input_format_skip_unknown_fields = 1 → 兼容 producer 加新字段（A3 schema_version V）
+-- 配套 server-level：stream_flush_interval_ms=2000（见 deploy/clickhouse/users.d/slink-stream-flush.xml）
+-- 调优依据：docs/bench/day-23-p1-ch-config-tuning.md（追平时间 13min → 3min 目标）
 --
 -- group：slink.click_events.clickhouse_writer（v0.5 §7 封板，与 PG group `pg_writer` 完全独立）
 -- topic：slink.click_events（与 v0.4 producer 同 topic）
@@ -42,8 +44,8 @@ SETTINGS
     kafka_topic_list = 'slink.click_events',
     kafka_group_name = 'slink.click_events.clickhouse_writer',
     kafka_format = 'JSONEachRow',
-    kafka_num_consumers = 2,
-    kafka_max_block_size = 1000,
+    kafka_num_consumers = 4,
+    kafka_max_block_size = 500,
     kafka_skip_broken_messages = 0,
     input_format_skip_unknown_fields = 1;
 

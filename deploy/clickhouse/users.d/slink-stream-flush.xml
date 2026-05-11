@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<!--
+  slink Day 23 P1 — CH config 调优（追平时间 13min → 3min）
+  关联：docs/bench/day-23-p1-ch-config-tuning.md
+
+  stream_flush_interval_ms = 2000
+    控制 Kafka Engine 在没攒满 kafka_max_block_size 时的强制 flush 周期
+    默认 7500ms，调成 2000ms = 3.75× 灵敏
+    与 kafka_max_block_size=500 (migration 0003) + kafka_num_consumers=4 (migration 0003)
+    组合理论提升 ~15×
+
+  挂载到 /etc/clickhouse-server/users.d/，CH 启动时合并到主 users.xml profile default
+-->
+<clickhouse>
+    <profiles>
+        <default>
+            <stream_flush_interval_ms>2000</stream_flush_interval_ms>
+        </default>
+    </profiles>
+</clickhouse>

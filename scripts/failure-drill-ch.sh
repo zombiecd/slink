@@ -113,8 +113,9 @@ inject_fault() {
        do_run "docker stop ${CH_CONTAINER}" ;;
     B) info "[t=${INJECT_AT}s] Round B: docker pause ${CH_CONTAINER}"
        do_run "docker pause ${CH_CONTAINER}" ;;
-    C) info "[t=${INJECT_AT}s] Round C: DETACH MV click_events_ch_kafka_mv"
-       do_run "docker exec ${CH_CONTAINER} clickhouse-client --user ${CH_USER} --password ${CH_PASSWORD} -d ${CH_DB} --query 'DETACH TABLE click_events_ch_kafka_mv'" ;;
+    C) info "[t=${INJECT_AT}s] Round C: DETACH MV click_events_ch_main_mv"
+       # Day 23 修复：表名错（原写 click_events_ch_kafka_mv，与 migration 0003 实际名 click_events_ch_main_mv 不一致）
+       do_run "docker exec ${CH_CONTAINER} clickhouse-client --user ${CH_USER} --password ${CH_PASSWORD} -d ${CH_DB} --query 'DETACH TABLE click_events_ch_main_mv'" ;;
     *) fail "unknown round $round"; exit 2 ;;
   esac
 }
@@ -125,8 +126,9 @@ recover_fault() {
        do_run "docker start ${CH_CONTAINER}" ;;
     B) info "[t=${RECOVER_AT}s] Round B: docker unpause ${CH_CONTAINER}"
        do_run "docker unpause ${CH_CONTAINER}" ;;
-    C) info "[t=${RECOVER_AT}s] Round C: ATTACH MV click_events_ch_kafka_mv"
-       do_run "docker exec ${CH_CONTAINER} clickhouse-client --user ${CH_USER} --password ${CH_PASSWORD} -d ${CH_DB} --query 'ATTACH TABLE click_events_ch_kafka_mv'" ;;
+    C) info "[t=${RECOVER_AT}s] Round C: ATTACH MV click_events_ch_main_mv"
+       # Day 23 修复：表名同 inject_fault 一并改
+       do_run "docker exec ${CH_CONTAINER} clickhouse-client --user ${CH_USER} --password ${CH_PASSWORD} -d ${CH_DB} --query 'ATTACH TABLE click_events_ch_main_mv'" ;;
   esac
 }
 

@@ -193,6 +193,11 @@ services:
     volumes:
       - slink-clickhouse-data:/var/lib/clickhouse
       - slink-clickhouse-logs:/var/log/clickhouse-server
+      # Day 23 P1: stream_flush_interval_ms profile default 注入
+      # 见 docs/bench/day-23-p1-ch-config-tuning.md
+      # 注意：只 mount 单文件 :ro，不能 mount 整个 users.d 目录，否则 CH entrypoint
+      # 写 default-user.xml 失败导致 restart loop（首次踩坑见 walkthrough/day-23.md §1.2）
+      - ./deploy/clickhouse/users.d/slink-stream-flush.xml:/etc/clickhouse-server/users.d/slink-stream-flush.xml:ro
     healthcheck:
       # 双坑：alpine BusyBox wget --spider 行为与 GNU wget 不同 (-O - 替代)；
       # 容器内 localhost 可能解析 IPv6 (::1) 而 CH 只监听 IPv4 0.0.0.0 → 用 127.0.0.1。
