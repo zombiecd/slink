@@ -134,9 +134,42 @@ func NewKafkaProducer(cfg KafkaConfig) (*KafkaProducer, error) {
 	// 初始 healthy=true：避免启动后 1s 内 healthcheck 还没跑就被判 unhealthy。
 	// 真实健康由首次 ping 在 healthCheckInterval 内修正。
 	p.healthy.Store(true)
+	// Day 24 加：同步 warmup（broker 连接 + metadata 预拉）。
+	// 失败仅 warn 不阻塞启动 — 保留"broker 失联时 server 仍可启动 + healthcheck 后续自愈"语义。
+	p.warmup()
 	p.wg.Add(1)
 	go p.runHealthCheck()
 	return p, nil
+}
+
+// warmupTimeout 是 NewKafkaProducer 同步等首次 broker 连接 + metadata 拉取的上限。
+// 3s 给慢网络余量；超时不阻塞启动（healthcheck 会持续修正）。
+const warmupTimeout = 3 * time.Second
+
+// warmup 在 NewKafkaProducer 返回前同步触发 broker tcp 连接 + metadata 拉取。
+//
+// Day 22 P4-v2 教训：drill v2 连跑 3 轮 wrk，R1 drop 集中（max 3.38% mean 1.13%），
+// R2+R3 全 0。根因是 NewKafkaProducer 返回时 broker tcp + partition metadata 都是
+// lazy 状态，wrk 启动瞬间高 QPS 打爆 SendTimeout 100ms 闸 — 第一波 record 在等
+// metadata 时排队超时进 dropped。
+//
+// 加 warmup 后：NewKafkaProducer 返回时 broker 连接 + metadata 已就位（≤ 3s），第一
+// 波 Enqueue 不再撞 cold-start 延迟。partition leader connection 仍由 kgo lazy
+// 建立（首条 Produce 时），但单次建链延迟通常 < 10ms 不会打爆 100ms timeout。
+//
+// 行为：
+//   - Ping 成功 → 静默继续（healthy 已是 true）
+//   - Ping 失败 → slog.Warn + 标记 unhealthy；不返回 error 不阻塞启动
+//
+// 不发 dummy record 的原因：会污染目标 topic，consumer 需特殊跳过逻辑。Ping 触发
+// 的 broker 连接 + metadata 已覆盖大部分 cold-start 场景。
+func (p *KafkaProducer) warmup() {
+	ctx, cancel := context.WithTimeout(p.bgCtx, warmupTimeout)
+	defer cancel()
+	if err := p.cli.Ping(ctx); err != nil {
+		slog.Warn("kafka producer warmup ping failed (启动继续，healthcheck 后续自愈)", "err", err)
+		p.healthy.Store(false)
+	}
 }
 
 // healthCheckInterval / healthCheckTimeout 固化为决策稿 §5.3 同档：

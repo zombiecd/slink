@@ -82,6 +82,58 @@ preflight() {
   info "preflight ok"
 }
 
+# ── 等 PG/CH 消费追完稳态（lag 归零代理判断） ──────────────────
+# Day 24 加：reset_baseline 前先等前一轮 drain 真追完。
+#
+# 没有用 kafka-consumer-groups.sh --describe 查 lag 的原因：
+# - PG consumer 是独立 kgo client，group `slink.click_events.pg_writer`
+# - CH Kafka Engine 是 CH 内部消费，group 名由 SETTINGS kafka_group_name 控
+# 双源 lag 查询要分别走 kafka 容器 CLI，命令链长且 awk parse 脆弱。
+#
+# 代理判断：PG consumer.inserted（累计写入）+ CH 主表 count() 在 STABLE_SECS 秒内
+# 都不变，视为追完。这种"稳态"信号在 wrk 已停 / drain 期内可靠。
+#
+# 边界：如果 producer 仍在打消息（理论上 reset_baseline 时不应有），稳态永远不满足，
+# 等到 max_wait 超时强制继续 + warn。
+wait_for_lag_zero() {
+  local max_wait="${1:-90}"      # 默认最多等 90s（drain 60s + 余量）
+  local stable_secs="${2:-5}"    # 稳态判断窗口：连续 N 秒不变
+  local start=$(date +%s)
+  local prev_c_inserted="" prev_ch_rows="" stable_for=0
+
+  if [ "$DRY_RUN" = "1" ]; then
+    info "wait_for_lag_zero: dry run skip"
+    return 0
+  fi
+
+  info "wait_for_lag_zero: 等前一轮 drain 真追完（max ${max_wait}s / stable ${stable_secs}s）"
+  while true; do
+    local elapsed=$(( $(date +%s) - start ))
+    if [ "$elapsed" -ge "$max_wait" ]; then
+      warn "wait_for_lag_zero: 超时 ${max_wait}s 强制继续（c_inserted=${prev_c_inserted} ch_rows=${prev_ch_rows} 仍未稳定）"
+      return 1
+    fi
+
+    local c_inserted ch_rows
+    c_inserted=$(curl -sf --max-time 1 --noproxy '*' "${CONSUMER_ADDR}/debug/stats" 2>/dev/null \
+      | python3 -c 'import json,sys;print(json.load(sys.stdin).get("inserted",0))' 2>/dev/null || echo 0)
+    ch_rows=$(docker exec "${CH_CONTAINER}" clickhouse-client --user "${CH_USER}" --password "${CH_PASSWORD}" -d "${CH_DB}" --query "SELECT count() FROM click_events_ch" 2>/dev/null || echo -1)
+
+    if [ "$c_inserted" = "$prev_c_inserted" ] && [ "$ch_rows" = "$prev_ch_rows" ]; then
+      stable_for=$(( stable_for + 1 ))
+      if [ "$stable_for" -ge "$stable_secs" ]; then
+        info "wait_for_lag_zero: 追完稳态 (c_inserted=${c_inserted} ch_rows=${ch_rows} 稳定 ${stable_secs}s / 耗时 ${elapsed}s)"
+        return 0
+      fi
+    else
+      stable_for=0
+    fi
+    prev_c_inserted="$c_inserted"
+    prev_ch_rows="$ch_rows"
+    sleep 1
+  done
+}
+
 # ── baseline reset（每轮独立） ───────────────────────────────────
 # Day 22 P3 修复：移除 kafka-topics --delete + --create
 #
@@ -97,9 +149,15 @@ preflight() {
 #
 # 副作用：每轮 baseline 不是 broker LEO=0 的"全新"环境。使用 FROM/TO 时间窗口
 # 过滤 recon 即可区分前后轮事件（recon-fixture.sh 已支持）。
+#
+# Day 24 加：TRUNCATE 前先 wait_for_lag_zero。
+# 触发场景：上一轮 drain 60s 不够时（CH 大量 lag / consumer 卡顿），不等 lag 0
+# 就 truncate，下一轮 baseline 会被前一轮残留消费污染。Day 22 教训：reset_baseline
+# 的本意是"恢复干净起点"，不只是清表，还要保证 consumer 真追上了 broker。
 reset_baseline() {
   local round="$1"
   bold "═══ Reset baseline for Round ${round}"
+  wait_for_lag_zero
   do_run "docker exec ${PG_CONTAINER} psql -U ${PG_USER} -d ${PG_DB} -c 'TRUNCATE click_events;'"
   do_run "docker exec ${CH_CONTAINER} clickhouse-client --user ${CH_USER} --password ${CH_PASSWORD} -d ${CH_DB} --query 'TRUNCATE TABLE click_events_ch'"
   sleep 2
@@ -113,8 +171,25 @@ inject_fault() {
        do_run "docker stop ${CH_CONTAINER}" ;;
     B) info "[t=${INJECT_AT}s] Round B: docker pause ${CH_CONTAINER}"
        do_run "docker pause ${CH_CONTAINER}" ;;
-    C) info "[t=${INJECT_AT}s] Round C: DETACH MV click_events_ch_main_mv"
-       # Day 23 修复：表名错（原写 click_events_ch_kafka_mv，与 migration 0003 实际名 click_events_ch_main_mv 不一致）
+    C) info "[t=${INJECT_AT}s] Round C: DETACH kafka 表 + MV (安全模式：先停 offset 推进)"
+       # Day 24 修复：Round C 改安全流程
+       #
+       # 历史背景：Day 23 P2 v3 Round C 单 DETACH MV 跑出 51% 数据丢失（PG 4.13M / CH 2.01M）。
+       # 详见 docs/bench/day-23-p2-failure-drill-abc.md + wiki 40-wiki/database/ClickHouse-Kafka-Engine-MV-DETACH-数据丢失.md
+       #
+       # 根因：Kafka Engine 表 click_events_ch_kafka_main 在 DETACH MV 期间仍持续消费 Kafka topic
+       # 并推进 consumer group offset。MV ATTACH 后从 kafka 表 SELECT，但 offset 已过故障窗口，
+       # 该段数据永久无法回放。51% ≈ 30s 故障 / 60s 总时长。
+       #
+       # Round C 的设计本意是验证「分析侧短暂挂掉后能自愈」（与 Round A/B docker stop/pause 同类）。
+       # 用单 DETACH MV 模拟实际上是「真破坏性故障」，故障演练赛道选错。
+       #
+       # 安全模式 = 同时 DETACH kafka 表 + MV，顺序：kafka → MV。
+       # - DETACH kafka 表：CH 停止消费 + 不再推 offset commit
+       # - DETACH MV：模拟 MV 在线维护
+       # - 故障窗口内 broker 上数据照常累积（producer 持续写）
+       # - 恢复 ATTACH 顺序反过来：MV → kafka，kafka 表从 last commit offset 续，broker 数据可消费
+       do_run "docker exec ${CH_CONTAINER} clickhouse-client --user ${CH_USER} --password ${CH_PASSWORD} -d ${CH_DB} --query 'DETACH TABLE click_events_ch_kafka_main'"
        do_run "docker exec ${CH_CONTAINER} clickhouse-client --user ${CH_USER} --password ${CH_PASSWORD} -d ${CH_DB} --query 'DETACH TABLE click_events_ch_main_mv'" ;;
     *) fail "unknown round $round"; exit 2 ;;
   esac
@@ -126,9 +201,13 @@ recover_fault() {
        do_run "docker start ${CH_CONTAINER}" ;;
     B) info "[t=${RECOVER_AT}s] Round B: docker unpause ${CH_CONTAINER}"
        do_run "docker unpause ${CH_CONTAINER}" ;;
-    C) info "[t=${RECOVER_AT}s] Round C: ATTACH MV click_events_ch_main_mv"
-       # Day 23 修复：表名同 inject_fault 一并改
-       do_run "docker exec ${CH_CONTAINER} clickhouse-client --user ${CH_USER} --password ${CH_PASSWORD} -d ${CH_DB} --query 'ATTACH TABLE click_events_ch_main_mv'" ;;
+    C) info "[t=${RECOVER_AT}s] Round C: ATTACH MV + kafka 表 (反向顺序)"
+       # Day 24 修复：恢复顺序与 inject 反过来。
+       # - 先 ATTACH MV：让物化视图就位
+       # - 后 ATTACH kafka 表：CH 从 last commit offset 续消费，broker 上故障期数据可被 MV 写入主表
+       # 顺序反了的话 kafka 表先 ATTACH 会先推一波 offset 到 MV 还没接的"空窗"，造成漏写。
+       do_run "docker exec ${CH_CONTAINER} clickhouse-client --user ${CH_USER} --password ${CH_PASSWORD} -d ${CH_DB} --query 'ATTACH TABLE click_events_ch_main_mv'"
+       do_run "docker exec ${CH_CONTAINER} clickhouse-client --user ${CH_USER} --password ${CH_PASSWORD} -d ${CH_DB} --query 'ATTACH TABLE click_events_ch_kafka_main'" ;;
   esac
 }
 
