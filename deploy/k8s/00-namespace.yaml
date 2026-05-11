@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: slink
+  labels:
+    app: slink
+    version: v0.6

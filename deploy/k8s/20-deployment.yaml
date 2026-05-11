@@ -1,0 +1,139 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slink-server
+  namespace: slink
+  labels:
+    app: slink-server
+    version: v0.6
+spec:
+  # Phase 1 = 1 副本验证镜像 + 后端连通性
+  # Phase 2 = 解决三连锁后扩到 3
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: slink-server
+  template:
+    metadata:
+      labels:
+        app: slink-server
+        version: v0.6
+    spec:
+      # Phase 4 优雅停机 S5：drain 25s in-flight + Kafka flush，留 5s buffer
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: slink-server
+          image: slink-server:v0.6
+          # kind load docker-image 后本地有，不需要 pull
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 18080
+              protocol: TCP
+            - name: pprof
+              containerPort: 6060
+              protocol: TCP
+
+          env:
+            # ── 基础 ──
+            - name: SLINK_ADDR
+              value: ":18080"
+            - name: SLINK_PPROF_ADDR
+              # Pod 内 pprof 绑 0.0.0.0 才能从 service / kubectl port-forward 访问
+              # （host 模式默认 127.0.0.1:6060 是 v0.3 hardening 防 SSRF 的）
+              value: "0.0.0.0:6060"
+            - name: SLINK_BASE_URL
+              value: "http://localhost:18080"
+            - name: SLINK_LOG_LEVEL
+              value: "info"
+            - name: SLINK_ENV
+              value: "dev"
+
+            # ── PG ──（连到 host docker compose 的 :15432）
+            - name: SLINK_PG_DSN
+              value: "postgres://slink:slink@pg:15432/slink?sslmode=disable"
+            - name: SLINK_PG_MAX_CONNS
+              value: "20"
+            - name: SLINK_PG_MIN_CONNS
+              value: "2"
+
+            # ── Redis ──（host :16379）
+            - name: SLINK_REDIS_ADDR
+              value: "redis:16379"
+            - name: SLINK_REDIS_DB
+              value: "0"
+
+            # ── ID 号段（Phase 1 仍进程内，Phase 2 §8.1 换 Redis INCRBY）──
+            - name: SLINK_ID_STEP_SIZE
+              value: "1000"
+            - name: SLINK_ID_BIZ_TAG
+              value: "link"
+
+            # ── L1 cache ──
+            - name: SLINK_LOCAL_CACHE_SIZE
+              value: "4096"
+            - name: SLINK_LOCAL_CACHE_TTL
+              value: "1m"
+
+            # ── Kafka ──（host :19092）
+            - name: SLINK_EVENT_BACKEND
+              value: "kafka"
+            - name: SLINK_KAFKA_BROKERS
+              value: "kafka:19092"
+            - name: SLINK_KAFKA_TOPIC
+              value: "slink.click_events"
+            - name: SLINK_KAFKA_SEND_TIMEOUT
+              value: "100ms"
+            - name: SLINK_KAFKA_MAX_BUFFERED
+              value: "100000"
+            - name: SLINK_KAFKA_DELIVERY_TIMEOUT
+              value: "5s"
+
+            # ── ClickHouse ──（host :19000）
+            - name: SLINK_CH_ADDR
+              value: "clickhouse:19000"
+            - name: SLINK_CH_USER
+              value: "slink"
+
+          # readiness：K8s 摘流靠这个；Phase 2 优雅停机时 SIGTERM 后让 /healthz 主动 503
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 18080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          # liveness：进程死透才重启；不能太敏感（Kafka flush 可能持续 25s）
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 18080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 5
+
+          # 资源 request/limit 起步保守，wrk 实测后再调
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "128Mi"
+            limits:
+              cpu: "2"
+              memory: "512Mi"
+
+          # Phase 4 优雅停机 S1：preStop sleep 5 给 endpoint controller 摘流时间
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+          # ⚠️ distroless 没有 /bin/sh，preStop 需要 distroless-debug 或者改 SIGTERM 内处理
+          # Phase 1 跑通后 Phase 4 再补：要么换 base，要么 SIGTERM handler 内 sleep

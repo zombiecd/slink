@@ -1,0 +1,36 @@
+# 不进 image 的内容（image 越小 cold-start 越快）
+.git/
+.gitignore
+.github/
+
+# 项目级文档（>1MB 全部）
+docs/
+*.md
+CLAUDE.md
+
+# Spike 代码（v0.4/v0.5 一次性 benchmark，不进生产 image）
+cmd/spike-*/
+
+# 本地数据 / 临时
+*.log
+bench/
+scripts/
+
+# 容器栈配置（image 不需要）
+docker-compose.yml
+deploy/observability/
+.env
+.env.*
+
+# 测试产物
+*_test.go
+coverage.out
+*.pprof
+
+# K8s 配置（部署时用，不进 image）
+deploy/k8s/
+
+# IDE
+.vscode/
+.idea/
+*.swp

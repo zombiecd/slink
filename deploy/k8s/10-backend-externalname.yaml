@@ -1,0 +1,45 @@
+# Phase 1: 后端 PG / Redis / Kafka / ClickHouse 仍跑在 host docker compose 栈
+# 通过 ExternalName Service 让 Pod 里的进程用 "pg" / "redis" / "kafka" / "clickhouse"
+# 作为 DNS name 透明访问。
+#
+# kind on macOS Docker Desktop 默认支持 host.docker.internal（解析到宿主）
+# Pod 里 nslookup pg → CNAME host.docker.internal → 宿主 IP
+# 然后用 env 里指定的端口（15432/16379/19092/19000）连接 docker compose 暴露的 host port。
+#
+# v0.7+ 真正 K8s 化后端时，这层换成 StatefulSet ClusterIP service。
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg
+  namespace: slink
+spec:
+  type: ExternalName
+  externalName: host.docker.internal
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: slink
+spec:
+  type: ExternalName
+  externalName: host.docker.internal
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: slink
+spec:
+  type: ExternalName
+  externalName: host.docker.internal
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+  namespace: slink
+spec:
+  type: ExternalName
+  externalName: host.docker.internal

@@ -1,0 +1,19 @@
+# kind 集群配置（Phase 1 起）
+#
+# extraPortMappings 让 host:18080 直通 kind node:30080 → NodePort Service:30080 → Pod:18080
+# 绕过 kubectl port-forward 单 TCP 通道瓶颈（Phase 1 实测 22k RPS vs 应该 65k+）
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: slink
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # slink-server NodePort
+      - containerPort: 30080
+        hostPort: 18080
+        protocol: TCP
+      # admin (pprof + metrics + /debug/stats) NodePort
+      - containerPort: 30060
+        hostPort: 16060
+        protocol: TCP
