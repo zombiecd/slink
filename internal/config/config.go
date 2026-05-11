@@ -75,6 +75,15 @@ type Config struct {
 	KafkaDeliveryTimeout  time.Duration `env:"SLINK_KAFKA_DELIVERY_TIMEOUT" envDefault:"5s"`
 	KafkaBrokers          []string      `env:"-"` // 由 Validate 解析
 
+	// ── ClickHouse 分析数据源（v0.5 Day 25 新增）─────────
+	// CH 挂了不影响 server 启动 + PG 主路径（v0.4 立的"主路径不为下游退步"原则）。
+	// 空 CHAddr 视为禁用，/api/stats/* 返回 503。
+	CHAddr     string `env:"SLINK_CH_ADDR"     envDefault:""`
+	CHUser     string `env:"SLINK_CH_USER"     envDefault:"slink"`
+	CHPassword string `env:"SLINK_CH_PASSWORD" envDefault:"slink"`
+	CHDatabase string `env:"SLINK_CH_DATABASE" envDefault:"slink_analytics"`
+	CHTable    string `env:"SLINK_CH_TABLE"    envDefault:"click_events_ch"`
+
 	// ── 反向代理白名单（v0.3 H6 hardening）────────────────
 	// 仅当 RemoteAddr 落在这里面的 CIDR 时，才信任 X-Forwarded-For / X-Real-IP。
 	// 默认空 = 不信任 XFF（最安全），生产部署在 LB 后面时必须配置。

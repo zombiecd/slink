@@ -110,8 +110,12 @@ wait_for_lag_zero() {
   while true; do
     local elapsed=$(( $(date +%s) - start ))
     if [ "$elapsed" -ge "$max_wait" ]; then
+      # Day 25 修复：return 0 而不是 1。
+      # 原 return 1 在 `set -euo pipefail` 下让 reset_baseline 调用点触发 -e 退出，
+      # 整 drill 脚本在 Round B 前提早终止（Day 25 第一次跑实测 Round B/C 都没跑）。
+      # 按设计意图，超时本来就是"软告警，强制继续"，return 0 才是正确语义。
       warn "wait_for_lag_zero: 超时 ${max_wait}s 强制继续（c_inserted=${prev_c_inserted} ch_rows=${prev_ch_rows} 仍未稳定）"
-      return 1
+      return 0
     fi
 
     local c_inserted ch_rows

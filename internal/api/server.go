@@ -28,7 +28,16 @@ type Server struct {
 	links     *store.LinkRepo
 	linkCache *cache.LinkCache
 	events    event.Eventer
+	// stats 是 v0.5 新增 ClickHouse 分析查询数据源。
+	// 可为 nil（v0.1-v0.4 + 测试场景）：handler 会返回 503 不影响主路径。
+	stats statsRepo
 }
+
+// SetStats 在 NewServer 之后注入 ClickHouse 分析数据源（v0.5 +）。
+//
+// 单独 setter 避免 NewServer 签名爆炸（已有 5 参）。也允许 server 启动后
+// 异步注入（如 CH 尚未 healthy 时先返回 503，healthy 后再 SetStats）。
+func (s *Server) SetStats(r statsRepo) { s.stats = r }
 
 // Config 是 api 层需要的最小子集（不直接吃 *config.Config，避免反向依赖）。
 type Config struct {
@@ -80,6 +89,10 @@ func NewServer(
 func (s *Server) Routes() *router.Router {
 	r := router.New()
 	r.POST("/api/links", s.handleCreateLink)
+	// v0.5 分析查询（仅当 stats 注入时实际工作；未注入时 handler 返回 503）
+	r.GET("/api/stats/uv", s.handleStatsUV)
+	r.GET("/api/stats/topk", s.handleStatsTopK)
+	r.GET("/api/stats/timeseries", s.handleStatsTimeseries)
 	r.GET("/{code}", s.handleRedirect)
 	return r
 }

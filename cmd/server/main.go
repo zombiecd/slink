@@ -158,6 +158,35 @@ func run() error {
 		},
 		generator, linkRepo, linkCache, eventer,
 	)
+
+	// ── 6.1 ClickHouse 分析数据源（v0.5 Day 25 新增）─────
+	//
+	// CH dial 失败不中止 server 启动 — 保留"主路径不为下游退步"原则。
+	// 失败时 stats 保持 nil，/api/stats/* 返回 503，主链路（PG + Kafka）不受影响。
+	// CHAddr 空（即未配置）也走 nil 路径，跳过 dial。
+	var chRepo *store.ClickEventCHRepo
+	if cfg.CHAddr != "" {
+		var err error
+		chRepo, err = store.NewClickEventCHRepo(bootCtx, store.CHConfig{
+			Addr:     cfg.CHAddr,
+			User:     cfg.CHUser,
+			Password: cfg.CHPassword,
+			Database: cfg.CHDatabase,
+			Table:    cfg.CHTable,
+		})
+		if err != nil {
+			slog.Warn("clickhouse dial failed (启动继续，/api/stats/* 将 503)", "err", err, "addr", cfg.CHAddr)
+		} else {
+			defer func() {
+				if err := chRepo.Close(); err != nil {
+					slog.Error("clickhouse close", "err", err)
+				}
+			}()
+			apiSrv.SetStats(chRepo)
+			slog.Info("clickhouse analytics ready", "addr", cfg.CHAddr, "db", cfg.CHDatabase, "table", cfg.CHTable)
+		}
+	}
+
 	r := apiSrv.Routes()
 	r.GET("/healthz", api.Liveness(version))
 	r.GET("/readyz", api.Readiness(version, pgPool, redisCli))
