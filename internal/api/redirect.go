@@ -27,7 +27,7 @@ const codeMaxLen = 16
 
 // handleRedirect 处理 GET /{code}。
 //
-// 主路径 SLA：< 5ms（命中 Redis 时）→ 简历"扛 10w QPS"故事的源头。
+// 主路径 SLA：< 5ms（命中 Redis 时）。fasthttp + L1/L2 缓存可在单机扛 9w+ RPS。
 //
 // fasthttp 迁移要点（vs Day 6 net/http 版）：
 //   - path param 通过 ctx.UserValue("code").(string) 读取，

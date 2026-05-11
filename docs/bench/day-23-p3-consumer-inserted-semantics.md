@@ -1,7 +1,7 @@
 # Day 23 P3 — consumer.inserted 字段语义核查
 
 > 2026-05-11 / 纯代码核查 / 不动 stack
-> 关联：Day 22 P3 末观察的 `inserted=5M vs PG count=9.88M` 矛盾（journal/day-22.md §4）
+> 关联：Day 22 P3 末观察的 `inserted=5M vs PG count=9.88M` 矛盾
 
 ## 摘要 — 不是字段 bug，是诊断时点错误
 
@@ -52,7 +52,7 @@ c.cli.CommitUncommittedOffsets(commitCtx)
 
 ## Day 22 P3 矛盾的真因
 
-### 时序还原（按 walkthrough/day-22.md §2 + §5）
+### 时序还原（Day 22 实测时序）
 
 ```
 T1: P2 baseline wrk 60s 跑完

@@ -116,7 +116,7 @@ Day 8 报告写"L1 hit rate ≥99%"，是基于"redis 没进 profile top 40 → 
 
 Day 9 实测：**99.97%**（30s 内 L1 hits 3,768,487 / total 3,769,682）。
 
-差距很小（估算 ≥99% vs 实测 99.97%），证明 Day 8 的判断方向对，但实测数字才是上简历用的硬通货。
+差距很小（估算 ≥99% vs 实测 99.97%），证明 Day 8 的判断方向对，但只有实测数字才是真硬通货。
 
 ## 五、Day 8 假设的真伪
 
@@ -155,7 +155,7 @@ curl -sS http://127.0.0.1:6060/debug/stats | python3 -m json.tool
 | # | 方向 | 预期 | 难度 |
 |---|---|---|---|
 | 1 | **多 flusher worker 并行**（4 × 30k/s）| 真正消 dropped | 中 |
-| 2 | metrics + Prometheus（基于已有 stats endpoint，几乎"白嫖"）| 简历可见性 | 低 |
+| 2 | metrics + Prometheus（基于已有 stats endpoint，几乎"白嫖"）| 工程可见性 | 低 |
 | 3 | Docker compose 工程化（多服务编排）| 可发布给 reviewer 看 | 低 |
 | 4 | 限流 + 退化（突破 buffer 时返回 503/记 sample）| 不丢 click 的兜底 | 中 |
 

@@ -41,3 +41,8 @@ data/
 # 压测产物
 *.lua.out
 bench-results/
+
+# 私人开发日志（本地保留 / vault 归档，不入公开仓）
+docs/journal/
+docs/walkthrough/
+docs/retrospect/

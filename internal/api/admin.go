@@ -7,7 +7,7 @@
 // 用途：
 //  1. bench 后核对 L1 hit rate（不再靠 profile 间接估）
 //  2. 监控 Kafka producer dropped/errors，提前预警
-//  3. 简历讲故事时有现成数字（"L1 命中 99.7% / Kafka 100% acked / uptime 2 小时"）
+//  3. 一站式拉取关键运行指标，方便排障/回顾
 //
 // 同端口 /metrics 由 prometheus client 提供，本文件只负责手写 JSON 视角。
 package api

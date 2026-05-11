@@ -174,7 +174,6 @@ P4-v2 PASS 改变 Day 23 优先级：
 ### 低优先
 
 7. v0.5 决策稿补完（CH 调优 + drill 三轮 + producer warmup）
-8. 简历更新 — 新增"压测发现 cold-start drop 集中现象 + 提出 warmup 方案"作为 v0.5 武器
 
 ---
 

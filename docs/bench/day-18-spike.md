@@ -109,7 +109,7 @@
 2. **复用 v0.4 pipeline 0 改动**：producer 不动 / topic 不动 / 现有 PG consumer 不动。只在 CH 端 apply migration 0002 即可
 3. **故障域真分离**：CH 重启 / 升级 / 抖动完全不影响 v0.4 主路径或 PG consumer。这是 v0.4 §11 决策表"故障域分离原则"的延伸
 4. **代码量最少**：0 行 Go consumer 代码（vs ch-go INSERT 路径需要 ~250 行）。维护成本最低
-5. **简历叙事更强**："使用 ClickHouse Kafka Engine + MaterializedView 解耦消费链路" 比"用 ch-go 实现 ClickHouse 高性能 INSERT" 设计感更强
+5. **设计感更强**："使用 ClickHouse Kafka Engine + MaterializedView 解耦消费链路" 比"用 ch-go 实现 ClickHouse 高性能 INSERT" 抽象层级更清晰
 
 **性能 -23%（161k vs 210k）的代价值得**：实际负载远低于天花板，设计简化收益压倒性。
 

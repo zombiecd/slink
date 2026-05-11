@@ -320,4 +320,4 @@ case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 - RPS 微升 +0.9%
 - 单测：API 包全绿，新 newEventID 10w 次 UUID 格式校验全通过
 
-收尾原则：**今天数字提升不大，但探底彻底**。下次面试讲："Day 6 我用 pprof 定位到瓶颈在 syscall 而非 alloc，所以单进程 21k 是 net/http 标准库天花板。要破必须横向多 process，这是 v0.2 的活。"
+收尾原则：**今天数字提升不大，但探底彻底**。结论：Day 6 用 pprof 定位到瓶颈在 syscall 而非 alloc，单进程 21k 是 net/http 标准库天花板。要破必须横向多 process —— 这是 v0.2 的活。
