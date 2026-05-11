@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/trace"
+
+	slinkotel "github.com/zombiecd/slink/internal/otel"
 )
 
 // KafkaProducer 把 ClickEvent 异步投递到 Kafka topic（v0.4 新路径）。
@@ -234,7 +237,22 @@ func (p *KafkaProducer) runHealthCheck() {
 //
 // caller ctx 被忽略 — 主路径 ctx 取消不应影响已入 buffer 的 record。
 // 100ms 上限通过 p.bgCtx + SendTimeout 保证。
-func (p *KafkaProducer) Enqueue(_ context.Context, evt ClickEvent) error {
+func (p *KafkaProducer) Enqueue(ctx context.Context, evt ClickEvent) error {
+	// OTel: 创建 producer span（kind=Producer），inject W3C traceparent 到 record headers
+	// 让 consumer 端可以续 trace。同步段创建 + defer End（span duration ≈ enqueue 阻塞时间）
+	// 不在 callback End span：异步路径 span 生命周期 ≠ caller goroutine（常见 fire-and-forget 设计）
+	spanCtx, span := slinkotel.Tracer().Start(
+		ctx,
+		"kafka.publish slink.click_events",
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			slinkotel.StringAttr("messaging.system", "kafka"),
+			slinkotel.StringAttr("messaging.destination.name", p.topic),
+			slinkotel.StringAttr("slink.click.code", evt.Code),
+		),
+	)
+	defer span.End()
+
 	body, err := encodeClickEvent(evt)
 	if err != nil {
 		p.errors.Add(1)
@@ -246,6 +264,11 @@ func (p *KafkaProducer) Enqueue(_ context.Context, evt ClickEvent) error {
 		Value: body,
 		Topic: p.topic,
 	}
+
+	// OTel: inject trace context 到 record.Headers (W3C traceparent format)
+	slinkotel.InjectKafkaHeaders(spanCtx, func(k, v string) {
+		rec.Headers = append(rec.Headers, kgo.RecordHeader{Key: k, Value: []byte(v)})
+	})
 
 	// 100ms 主路径硬上限：buffer 没满立即返回，buffer 满则 ctx done → callback 拿 cancel
 	sendCtx, cancel := context.WithTimeout(p.bgCtx, p.cfg.SendTimeout)

@@ -214,6 +214,27 @@ services:
       retries: 10
       start_period: 15s
 
+  # ─── Jaeger backend（v0.6 Phase 4.1 OTel trace 落地）───────────
+  # all-in-one：单容器跑 collector + query + UI
+  # OTLP gRPC :4317 接收 OTel collector 转发；UI :16686 浏览
+  # 不暴露 Jaeger 自己的 collector :14268（用 OTel collector 中转）
+  jaeger:
+    image: jaegertracing/all-in-one:1.76.0
+    container_name: slink-jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "14317:4317"    # OTLP gRPC（host 用 14317 避撞 OTel collector）
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      LOG_LEVEL: "info"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:16686/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
 volumes:
   slink-pg-data:
   slink-redis-data:

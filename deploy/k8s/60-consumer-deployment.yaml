@@ -1,0 +1,102 @@
+# slink consumer Deployment（v0.6 Phase 4.3）
+#
+# 设计：
+#   - replicas=2（Kafka topic 4 partitions / 2 副本各 2 partition）
+#   - Kafka group rebalance 自然处理副本变动
+#   - Deployment 不 StatefulSet：consumer 无状态（offset 在 broker）
+#   - S1-S7 优雅停机沿用 server 模式：terminationGracePeriodSeconds=30 + Go 内 SIGTERM handler
+#
+# 配套：
+#   deploy/k8s/50-network-policy.yaml 限 consumer Pod 只能访问 PG/Kafka
+#   docker compose 的 cmd/consumer host 进程 EOD 下线
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slink-consumer
+  namespace: slink
+  labels:
+    app: slink-consumer
+    version: v0.6
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: slink-consumer
+  template:
+    metadata:
+      labels:
+        app: slink-consumer
+        version: v0.6
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: slink-consumer
+          image: slink-consumer:v0.6
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: admin
+              containerPort: 18081
+              protocol: TCP
+
+          env:
+            - name: SLINK_PG_DSN
+              value: "postgres://slink:slink@pg:15432/slink?sslmode=disable"
+            - name: SLINK_KAFKA_BROKERS
+              value: "kafka:19093"   # K8s 路径走 EXTERNAL_K8S（同 server 修法）
+            - name: SLINK_CONSUMER_TABLE
+              value: "click_events"
+            - name: SLINK_CONSUMER_GROUP
+              value: "slink.click_events.pg_writer"
+            - name: SLINK_CONSUMER_BATCH_SIZE
+              value: "1000"
+            - name: SLINK_CONSUMER_HTTP_ADDR
+              value: ":18081"
+            - name: SLINK_ENV
+              value: "dev"
+
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 18081
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 18081
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 1000m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slink-consumer
+  namespace: slink
+spec:
+  type: ClusterIP
+  selector:
+    app: slink-consumer
+  ports:
+    - name: admin
+      port: 18081
+      targetPort: admin

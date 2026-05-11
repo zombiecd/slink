@@ -1,0 +1,69 @@
+# slink Ingress (v0.6 Phase 4.2)
+#
+# 设计：分两个 Ingress 资源
+#   1. slink-business：业务路径 / + /api/links + /:code，**无 AuthN**（公网开放）
+#   2. slink-stats：/api/stats/*，**basic auth**（admin only）
+#
+# Secret: slink-stats-auth（已通过 kubectl create secret 落地）
+# Username/password: admin / slink-admin-pwd（dev 默认）
+#
+# 测试通道：
+#   `kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 18888:80`
+#   生产：kind extraPortMapping 18888 → 30498(NodePort) 留 v0.7 真集群
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: slink-business
+  namespace: slink
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /api/links
+            pathType: Prefix
+            backend:
+              service:
+                name: slink-server
+                port:
+                  number: 18080
+          - path: /healthz
+            pathType: Prefix
+            backend:
+              service:
+                name: slink-server
+                port:
+                  number: 18080
+          # /:code 跳转（除 /api/* 全走，需要 regex 排除 stats）
+          - path: /[a-zA-Z0-9]{4,12}
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: slink-server
+                port:
+                  number: 18080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: slink-stats
+  namespace: slink
+  annotations:
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: slink-stats-auth
+    nginx.ingress.kubernetes.io/auth-realm: "slink stats - admin only"
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /api/stats
+            pathType: Prefix
+            backend:
+              service:
+                name: slink-server
+                port:
+                  number: 18080

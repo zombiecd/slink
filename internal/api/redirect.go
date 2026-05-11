@@ -16,6 +16,7 @@ import (
 	"github.com/zombiecd/slink/internal/cache"
 	"github.com/zombiecd/slink/internal/event"
 	"github.com/zombiecd/slink/internal/model"
+	slinkotel "github.com/zombiecd/slink/internal/otel"
 	"github.com/zombiecd/slink/internal/store"
 )
 
@@ -146,7 +147,11 @@ func (s *Server) enqueueClickEvent(ctx *fasthttp.RequestCtx, code string) {
 		TS:        time.Now().UTC(),
 	}
 
-	if err := s.events.Enqueue(context.Background(), evt); err != nil {
+	// v0.6 Phase 4.1：传 OTel context（含 server span）让 KafkaProducer 能续 trace。
+	// KafkaProducer.Enqueue 设计上仍忽略 caller cancel（用 p.bgCtx 创建 sendCtx），
+	// 这里的 ctx 仅用于 trace propagation 不影响 cancel 语义。
+	otelCtx := slinkotel.CtxFromFasthttp(ctx)
+	if err := s.events.Enqueue(otelCtx, evt); err != nil {
 		// Enqueue 失败（buffer 满 / 关闭中）：仅记日志，不影响跳转
 		slog.Warn("enqueue click event failed", "code", code, "err", err)
 	}

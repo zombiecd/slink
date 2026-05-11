@@ -1,0 +1,92 @@
+# slink NetworkPolicy（v0.6 Phase 4.3）
+#
+# 设计：默认 deny + 白名单（防御纵深第二层，配合 §4.2 Ingress AuthN）
+#
+# 白名单规则：
+#   - slink-server Pod   → PG / Redis / Kafka / ClickHouse 后端 (host.docker.internal via ExternalName)
+#   - slink-consumer Pod → PG / Kafka 后端
+#   - slink-server / slink-consumer Pod → otel-collector （trace export）
+#   - ingress-nginx Pod  → slink-server Pod (业务路径 + /api/stats with AuthN)
+#
+# 注意：K8s NetworkPolicy 是 L3/L4 IP/port 层。ExternalName Service 路由到 host.docker.internal
+# 后实际是 outbound 到节点外，NetworkPolicy egress 规则需用 ipBlock 或 namespaceSelector。
+# 对 host.docker.internal 这种特殊场景（kind on docker），最简化：egress 全允许 + ingress 严格控制。
+#
+# 真集群（GKE/EKS）下应用 egress 白名单（仅放行后端 ServiceAccount/IP block）留 v0.7。
+---
+# 默认 deny ingress（不影响 egress，因为后端在 K8s 外靠 host.docker.internal）
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: slink
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# slink-server: 仅 ingress-nginx 可访问 18080（业务）和 6060（pprof，dev only）
+# 同 namespace 内 otel-collector 不需要访问 server
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: slink-server-allow-ingress
+  namespace: slink
+spec:
+  podSelector:
+    matchLabels:
+      app: slink-server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 18080
+        - protocol: TCP
+          port: 6060
+---
+# slink-consumer: 允许同 ns Pod 访问 18081（admin/healthz/metrics）
+# 实际访问者：Prometheus scrape（如果在 K8s 内）+ liveness/readiness probe（kubelet）
+# kubelet probe 不受 NetworkPolicy 限制，所以这条规则主要是 Prometheus 路径
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: slink-consumer-allow-admin
+  namespace: slink
+spec:
+  podSelector:
+    matchLabels:
+      app: slink-consumer
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}  # 同 ns 任何 Pod
+      ports:
+        - protocol: TCP
+          port: 18081
+---
+# otel-collector: 允许同 ns 所有 Pod 推 trace（OTLP gRPC 4317 / HTTP 4318）
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: otel-collector-allow-otlp
+  namespace: slink
+spec:
+  podSelector:
+    matchLabels:
+      app: otel-collector
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}  # 同 ns 任何 Pod
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318

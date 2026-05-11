@@ -34,6 +34,7 @@ import (
 	"github.com/zombiecd/slink/internal/event"
 	"github.com/zombiecd/slink/internal/id"
 	"github.com/zombiecd/slink/internal/metrics"
+	slinkotel "github.com/zombiecd/slink/internal/otel"
 	"github.com/zombiecd/slink/internal/store"
 )
 
@@ -84,6 +85,27 @@ func run() error {
 		"env", cfg.Env,
 		"addr", cfg.Addr,
 	)
+
+	// ── 2.5 OTel tracer 初始化（v0.6 Phase 4.1）────────────────
+	// 空 SLINK_OTEL_ENDPOINT 走 noop（保留 v0.1-v0.5 行为兼容）
+	otelEndpoint := os.Getenv("SLINK_OTEL_ENDPOINT")
+	otelShutdown, err := slinkotel.InitTracer(context.Background(), slinkotel.Config{
+		Endpoint:    otelEndpoint,
+		ServiceName: "slink-server",
+		ServiceVer:  version,
+		Env:         cfg.Env,
+	})
+	if err != nil {
+		return fmt.Errorf("otel init: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = otelShutdown(shutdownCtx)
+	}()
+	if otelEndpoint != "" {
+		slog.Info("otel tracer initialized", "endpoint", otelEndpoint)
+	}
 
 	// ── 3. 建立依赖（store / cache），启动时验证可达 ─────────
 	bootCtx, bootCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -237,6 +259,10 @@ func run() error {
 	//                      v0.3 hardening：封单 IP 连接数 + 单连接复用 + 全局并发
 	// Day 10: 包一层 Prometheus middleware（counter + histogram）
 	rootHandler := metricsReg.FastHTTPMiddleware(r.Handler)
+	// v0.6 Phase 4.1: 最外层包 OTel middleware（server-kind span / W3C traceparent extract）
+	// 顺序：OTel(外) → Prometheus → router → handler
+	// OTel 在外层让 span 包住 Prometheus 测量，trace 能看到 metric 点也算时间
+	rootHandler = slinkotel.FasthttpMiddleware(rootHandler)
 
 	httpSrv := &fasthttp.Server{
 		Handler:            rootHandler,

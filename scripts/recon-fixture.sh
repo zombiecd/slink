@@ -35,6 +35,33 @@ FROM="${FROM:-$DEFAULT_FROM}"
 TO="${TO:-$DEFAULT_TO}"
 STRICT="${STRICT:-0}"
 
+# v2 (Day 30 Phase 4.4): AUTO_WINDOW=1 模式
+# 当 FROM/TO 都未显式设 + AUTO_WINDOW=1 时，从 PG click_events.max(ts) 反推窗口：
+#   FROM = max(ts) - LAST_N_MIN 分钟
+#   TO   = max(ts) + 5s（确保 max(ts) 在窗口内）
+# 解决 v1 时间窗 bug：v1 默认窗口 [now-1h, now-5min) 在 drill 跑完立即对账时
+# 数据时间在 last 5min 区间内 → 窗口算出 0 行 → R1 误报 FAIL（v0.5 retro §3.7 已账）
+#
+# 用法：AUTO_WINDOW=1 LAST_N_MIN=10 ./scripts/recon-fixture.sh
+AUTO_WINDOW="${AUTO_WINDOW:-0}"
+LAST_N_MIN="${LAST_N_MIN:-30}"
+
+if [ "$AUTO_WINDOW" = "1" ] && [ -z "${FROM_RAW:-${FROM_OVERRIDE:-}}" ] && [ "$FROM" = "$DEFAULT_FROM" ] && [ "$TO" = "$DEFAULT_TO" ]; then
+  # 从 PG 拿灌数据期 max(ts) — 限最近 24h 防全表扫
+  AUTO_MAX_TS=$(docker exec "${PG_CONTAINER:-slink-pg}" psql -U "${PG_USER:-slink}" -d "${PG_DB:-slink}" -tAc \
+    "SELECT to_char(max(ts) AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') FROM click_events WHERE ts >= now() - interval '24 hours';" 2>/dev/null)
+  if [ -n "$AUTO_MAX_TS" ] && [ "$AUTO_MAX_TS" != " " ]; then
+    # BSD date 参数顺序：date -j [-v ADJUST] -f INPUT_FMT INPUT_VALUE +OUTPUT_FMT
+    FROM=$(LC_ALL=C date -u -j "-v-${LAST_N_MIN}M" -f '%Y-%m-%d %H:%M:%S' "$AUTO_MAX_TS" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+      || LC_ALL=C date -u -d "$AUTO_MAX_TS - $LAST_N_MIN minutes" '+%Y-%m-%d %H:%M:%S')
+    TO=$(LC_ALL=C date -u -j "-v+5S" -f '%Y-%m-%d %H:%M:%S' "$AUTO_MAX_TS" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+      || LC_ALL=C date -u -d "$AUTO_MAX_TS + 5 seconds" '+%Y-%m-%d %H:%M:%S')
+    printf '\033[36m[recon-v2]\033[0m AUTO_WINDOW=1 推算窗口 [%s, %s) (基于 PG max(ts)=%s, LAST_N_MIN=%s)\n' "$FROM" "$TO" "$AUTO_MAX_TS" "$LAST_N_MIN"
+  else
+    printf '\033[33m[recon-v2]\033[0m AUTO_WINDOW=1 但 PG click_events 24h 内无数据，沿用默认窗口\n'
+  fi
+fi
+
 # 漂移阈值
 R1_THRESHOLD="0.001"  # 0.1%
 R2_THRESHOLD="0.005"  # 0.5%

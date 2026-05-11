@@ -1,0 +1,33 @@
+# slink consumer image — v0.6 Phase 4.3
+#
+# 同 server Dockerfile multi-stage，仅 build target 不同：cmd/consumer
+# distroless 22MB / 无 shell / runtime safe / S1-S7 优雅停机沿用 Go 内时序
+#
+# 构建：docker build -t slink-consumer:v0.6 -f Dockerfile.consumer .
+# 加载到 kind：kind load docker-image slink-consumer:v0.6 --name slink
+
+# ── Stage 1: builder ──────────────────────────────
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /build
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY cmd/ cmd/
+COPY internal/ internal/
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+    go build -trimpath -ldflags="-s -w" \
+    -o /out/slink-consumer ./cmd/consumer
+
+# ── Stage 2: runtime ──────────────────────────────
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=builder /out/slink-consumer /app/slink-consumer
+
+# 18081 = consumer admin :stats / :healthz / :metrics（cmd/consumer/main.go 默认端口）
+EXPOSE 18081
+
+USER nonroot:nonroot
+ENTRYPOINT ["/app/slink-consumer"]
