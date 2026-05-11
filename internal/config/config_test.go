@@ -224,6 +224,7 @@ func validBase() *Config {
 		RedisAddr:             "localhost:16379",
 		IDStepSize:            1000,
 		IDBizTag:              "link",
+		IDSource:              "pg",
 		LocalCacheSize:        4096,
 		LocalCacheTTL:         time.Minute,
 		EventBackend:          "kafka", // v0.4 Day 16 切流后唯一 backend

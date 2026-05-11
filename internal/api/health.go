@@ -16,10 +16,31 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/valyala/fasthttp"
 )
+
+// ShutdownSignal 让 readiness handler 在收到 SIGTERM 后主动返 503，
+// 加速 K8s endpoint controller 摘流（v0.6 §8.3 S2）。
+//
+// 用 atomic.Bool 而不是 channel — readiness 是热路径（K8s 每 5s 探一次 × N Pod），
+// atomic load 比 channel select 快一档。
+type ShutdownSignal struct {
+	shuttingDown atomic.Bool
+}
+
+// MarkShuttingDown 标记进程进入停机阶段；之后 Readiness 返 503。
+// 主流程在收到 SIGTERM 时调一次（main.go）。
+func (s *ShutdownSignal) MarkShuttingDown() {
+	s.shuttingDown.Store(true)
+}
+
+// IsShuttingDown readiness 内部用。
+func (s *ShutdownSignal) IsShuttingDown() bool {
+	return s.shuttingDown.Load()
+}
 
 // PGPinger 是 readiness 检查 PostgreSQL 可达性的最小接口。
 //
@@ -57,8 +78,22 @@ func Liveness(version string) fasthttp.RequestHandler {
 //
 // probe 超时 2s 是为了配合 K8s 默认 timeoutSeconds=1：
 // 留 1s 给网络栈，防 K8s 直接判 timeout 把 Pod 摘掉。
-func Readiness(version string, pg PGPinger, rd RedisPinger) fasthttp.RequestHandler {
+//
+// shutdownSig 非 nil 且已标记停机时直接返 503，加速 K8s 摘流（v0.6 §8.3 S2）。
+// 单测可传 nil 跳过停机检查。
+func Readiness(version string, pg PGPinger, rd RedisPinger, shutdownSig *ShutdownSignal) fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
+		if shutdownSig != nil && shutdownSig.IsShuttingDown() {
+			ctx.Response.Header.Set("Content-Type", "application/json")
+			ctx.SetStatusCode(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(ctx).Encode(readyResp{
+				Status:   "shutting_down",
+				Version:  version,
+				Backends: map[string]string{"reason": "graceful shutdown in progress"},
+			})
+			return
+		}
+
 		probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
 

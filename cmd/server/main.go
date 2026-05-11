@@ -41,6 +41,12 @@ const (
 	version       = "v0.3-day10"
 	shutdownGrace = 10 * time.Second
 
+	// v0.6 §8.3 S2：preStop drain 等 K8s endpoint controller 摘流。
+	// K8s 实测 1-2s 完成异步摘流，留 5s 保险。
+	// 与 deployment.yaml terminationGracePeriodSeconds=30 配合：
+	// preStopDrain(5s) + shutdownGrace(10s) = 15s << 30s grace，留 buffer 防被 SIGKILL。
+	preStopDrain = 5 * time.Second
+
 	// 主端口允许的最大请求体（POST /api/links 仅吃几 KB JSON）。
 	// 远小于 fasthttp 默认 4MB，给 SSRF / DoS body 保险。
 	maxRequestBodySize = 16 * 1024 // 16 KB
@@ -106,15 +112,41 @@ func run() error {
 	slog.Info("redis connected", "addr", cfg.RedisAddr)
 
 	// ── 4. 建发号器 ────────────────────────────────────────
-	segRepo := store.NewSegmentRepo(pgPool)
-	buf, err := id.NewDoubleBuffer(bootCtx, segRepo, cfg.IDBizTag, cfg.IDStepSize, 0.9, logger)
+	// v0.6 §8.1：多 Pod 部署用 SLINK_ID_SOURCE=redis（INCRBY ~50μs，0 改主路径）；
+	// 单 Pod 默认 pg（v0.3 起跑）。
+	var idSrc id.SegmentSource
+	switch cfg.IDSource {
+	case "pg":
+		idSrc = store.NewSegmentRepo(pgPool)
+	case "redis":
+		redisSrc := store.NewRedisSegmentSource(redisCli.Raw())
+		// 启动期把 Redis 抬到 PG 旧号段表 max_id 之上，防迁移期 ID 倒退（多 Pod 滚动时一并安全）。
+		// PG 拿不到 floor 用 0：是 fresh deploy 还是 PG 故障由 server 健康检查兜底，不阻塞启动。
+		pgFloor, peekErr := store.NewSegmentRepo(pgPool).Peek(bootCtx, cfg.IDBizTag)
+		if peekErr != nil {
+			slog.Warn("id source bootstrap: PG peek failed, using floor=0",
+				"biz_tag", cfg.IDBizTag, "err", peekErr.Error())
+			pgFloor = 0
+		}
+		actual, ensureErr := redisSrc.EnsureMinimum(bootCtx, cfg.IDBizTag, pgFloor)
+		if ensureErr != nil {
+			return fmt.Errorf("id source bootstrap EnsureMinimum: %w", ensureErr)
+		}
+		slog.Info("id source bootstrap done",
+			"biz_tag", cfg.IDBizTag, "pg_floor", pgFloor, "redis_actual", actual)
+		idSrc = redisSrc
+	default:
+		return fmt.Errorf("unknown SLINK_ID_SOURCE %q (want pg|redis)", cfg.IDSource)
+	}
+	buf, err := id.NewDoubleBuffer(bootCtx, idSrc, cfg.IDBizTag, cfg.IDStepSize, 0.9, logger)
 	if err != nil {
 		return err
 	}
 	generator := id.NewGenerator(buf)
 	slog.Info("id generator ready",
 		"biz_tag", cfg.IDBizTag,
-		"step_size", cfg.IDStepSize)
+		"step_size", cfg.IDStepSize,
+		"source", cfg.IDSource)
 
 	// ── 5. 建 cache + 异步事件链路 ─────────────────────────
 	linkRepo := store.NewLinkRepo(pgPool)
@@ -188,8 +220,11 @@ func run() error {
 	}
 
 	r := apiSrv.Routes()
+	// v0.6 §8.3 S2：SIGTERM 后 readiness 主动返 503 加速 K8s 摘流
+	shutdownSig := &api.ShutdownSignal{}
+
 	r.GET("/healthz", api.Liveness(version))
-	r.GET("/readyz", api.Readiness(version, pgPool, redisCli))
+	r.GET("/readyz", api.Readiness(version, pgPool, redisCli, shutdownSig))
 
 	// ── 6.5 fasthttp 主 server ────────────────────────────
 	//
@@ -271,13 +306,26 @@ func run() error {
 		slog.Info("shutdown signal received", "signal", sig.String())
 	}
 
+	// v0.6 §8.3 优雅停机顺序（K8s 多 Pod）：
+	//   S1 readiness flip → K8s endpoint controller 摘流（这里立即翻 503）
+	//   S2 sleep preStopDrain：留时间给 Service 摘流量到其他 Pod（kubelet 摘 endpoint 异步）
+	//   S3 fasthttp Shutdown：等已有 in-flight request 完成
+	//   S4 KafkaProducer Close：flush 未发送的 record
+	//   S5 defer 链关 redisCli / pgPool
+	//
+	// distroless 镜像无 /bin/sh，deployment.yaml 的 preStop hook 不能用 shell。
+	// 所有停机时序在 Go 进程内完成，避免依赖 base image 工具链。
+	shutdownSig.MarkShuttingDown()
+	slog.Info("readiness flipped to 503 (S1)")
+
+	// S2：等 endpoint controller 摘流。K8s 实测 1-2s 完成，留 5s 保险。
+	// 配合 deployment.yaml maxUnavailable=0 + maxSurge=1 保证总有 Pod 接流量。
+	time.Sleep(preStopDrain)
+	slog.Info("drain sleep done", "duration", preStopDrain)
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
 
-	// 优雅停机顺序（v0.4 Day 16 切流后）：
-	//   1. fasthttp.Server ShutdownWithContext：停接新连接 + 等已有请求完成
-	//   2. KafkaProducer Close：Flush 在飞 record
-	//   3. defer 链关闭 redisCli / pgPool
 	if err := httpSrv.ShutdownWithContext(shutdownCtx); err != nil {
 		slog.Error("http server shutdown", "err", err)
 	}

@@ -53,6 +53,11 @@ type Config struct {
 	// ── 短码生成（号段模式）────────────────────────────────
 	IDStepSize int64  `env:"SLINK_ID_STEP_SIZE" envDefault:"1000"`
 	IDBizTag   string `env:"SLINK_ID_BIZ_TAG"   envDefault:"link"`
+	// IDSource 号段来源：
+	//   pg    — 默认，PG id_segment 表（v0.3 起一直跑）
+	//   redis — Redis INCRBY（v0.6 §8.1 多 Pod 部署用，50μs vs PG 1ms）
+	// 多 Pod 部署必须切 redis；单 Pod 用 pg 即可（性能差异在 RPS < 100k 下不显著）。
+	IDSource string `env:"SLINK_ID_SOURCE" envDefault:"pg"`
 
 	// ── L1 进程内缓存（Day 8）─────────────────────────────
 	// LocalCacheSize <= 0 → 禁用 L1，回到只用 Redis 的两层架构。
@@ -139,6 +144,12 @@ func (c *Config) Validate() error {
 	}
 	if c.IDStepSize <= 0 {
 		return errors.New("ID_STEP_SIZE must be > 0")
+	}
+	switch c.IDSource {
+	case "pg", "redis":
+		// ok
+	default:
+		return fmt.Errorf("SLINK_ID_SOURCE must be pg|redis, got %q", c.IDSource)
 	}
 	if _, err := url.Parse(c.BaseURL); err != nil {
 		return fmt.Errorf("BASE_URL is not a valid URL: %w", err)

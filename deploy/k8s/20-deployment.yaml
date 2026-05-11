@@ -9,7 +9,8 @@ metadata:
 spec:
   # Phase 1 = 1 副本验证镜像 + 后端连通性
   # Phase 2 = 解决三连锁后扩到 3
-  replicas: 1
+  # Day 27 Phase 2 P1：scale=2 验证跨 Pod L1 一致性
+  replicas: 2
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -69,11 +70,13 @@ spec:
             - name: SLINK_REDIS_DB
               value: "0"
 
-            # ── ID 号段（Phase 1 仍进程内，Phase 2 §8.1 换 Redis INCRBY）──
+            # ── ID 号段（Day 27 Phase 2 §8.1 切 Redis INCRBY，多 Pod 强制要求）──
             - name: SLINK_ID_STEP_SIZE
               value: "1000"
             - name: SLINK_ID_BIZ_TAG
               value: "link"
+            - name: SLINK_ID_SOURCE
+              value: "redis"
 
             # ── L1 cache ──
             - name: SLINK_LOCAL_CACHE_SIZE
@@ -130,10 +133,10 @@ spec:
               cpu: "2"
               memory: "512Mi"
 
-          # Phase 4 优雅停机 S1：preStop sleep 5 给 endpoint controller 摘流时间
-          lifecycle:
-            preStop:
-              exec:
-                command: ["/bin/sh", "-c", "sleep 5"]
-          # ⚠️ distroless 没有 /bin/sh，preStop 需要 distroless-debug 或者改 SIGTERM 内处理
-          # Phase 1 跑通后 Phase 4 再补：要么换 base，要么 SIGTERM handler 内 sleep
+          # Day 27 §8.3 S1-S4 优雅停机：全部在 Go 进程内（cmd/server/main.go SIGTERM handler）。
+          # distroless 无 /bin/sh，无法 exec shell preStop；改为：
+          #   1. SIGTERM → shutdownSig.MarkShuttingDown()（readiness 立即返 503，S1）
+          #   2. time.Sleep(preStopDrain=5s)（等 K8s 摘流，S2）
+          #   3. fasthttp.ShutdownWithContext()（drain in-flight，S3）
+          #   4. kafkaProducer.Close()（flush 在飞 record，S4）
+          # 总 budget ≤ 15s（5s drain + 10s shutdownGrace）< terminationGracePeriodSeconds=30s
