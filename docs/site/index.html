@@ -1,0 +1,1256 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>slink — Go 高并发短链服务（v0.1 → v0.6 Phase 4）</title>
+  <meta name="description" content="一个 Go 写的高并发短链服务，从单机 21k RPS baseline 演进到 K8s 多副本 + Kafka 异步 + ClickHouse OLAP + 全链路 OTel 的完整工程实践。">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism-tomorrow.min.css">
+  <style>
+    /* ──────────────────────────────────────────
+     * 基础 reset + 设计 token
+     * ──────────────────────────────────────── */
+    :root {
+      --bg: #0d1117;
+      --bg-elev: #161b22;
+      --bg-elev-2: #1c2128;
+      --border: #30363d;
+      --border-soft: #21262d;
+      --text: #c9d1d9;
+      --text-dim: #8b949e;
+      --text-bright: #f0f6fc;
+      --accent: #58a6ff;
+      --accent-hover: #79c0ff;
+      --success: #3fb950;
+      --warning: #d29922;
+      --danger: #f85149;
+      --highlight: #ffa657;
+      --code-bg: #1c2128;
+      --shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+      --radius: 6px;
+      --radius-lg: 12px;
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      --font-mono: "SF Mono", Monaco, "Cascadia Code", "Roboto Mono", Consolas, "Liberation Mono", monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-sans);
+      font-size: 15px;
+      line-height: 1.7;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ──────────────────────────────────────────
+     * Layout: 侧栏 + 主区
+     * ──────────────────────────────────────── */
+    .layout {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+
+    .toc {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow-y: auto;
+      padding: 32px 24px;
+      border-right: 1px solid var(--border-soft);
+      background: var(--bg);
+    }
+    .toc::-webkit-scrollbar { width: 6px; }
+    .toc::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    .toc-title {
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--text-bright);
+      margin-bottom: 4px;
+    }
+    .toc-subtitle {
+      font-size: 12px;
+      color: var(--text-dim);
+      margin-bottom: 24px;
+    }
+    .toc-link {
+      display: block;
+      padding: 6px 10px;
+      margin: 2px 0;
+      color: var(--text-dim);
+      text-decoration: none;
+      border-radius: 4px;
+      font-size: 13px;
+      transition: all 0.15s;
+      border-left: 2px solid transparent;
+    }
+    .toc-link:hover { color: var(--text-bright); background: var(--bg-elev); }
+    .toc-link.active {
+      color: var(--accent);
+      border-left-color: var(--accent);
+      background: rgba(88, 166, 255, 0.08);
+    }
+    .toc-link.sub { padding-left: 24px; font-size: 12px; }
+
+    main {
+      padding: 56px 64px 96px;
+      max-width: 1000px;
+    }
+
+    /* ──────────────────────────────────────────
+     * Hero / 速览卡
+     * ──────────────────────────────────────── */
+    .hero {
+      margin-bottom: 64px;
+    }
+    .hero h1 {
+      font-size: 42px;
+      font-weight: 800;
+      color: var(--text-bright);
+      letter-spacing: -0.02em;
+      margin-bottom: 12px;
+    }
+    .hero .tagline {
+      font-size: 18px;
+      color: var(--text-dim);
+      margin-bottom: 24px;
+      max-width: 720px;
+    }
+    .hero-badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 32px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 12px;
+      border-radius: 100px;
+      font-size: 12px;
+      font-weight: 600;
+      background: var(--bg-elev-2);
+      color: var(--text-dim);
+      border: 1px solid var(--border-soft);
+    }
+    .badge.go { color: #5fb3d4; }
+    .badge.ch { color: #ffcc01; }
+    .badge.k8s { color: #326ce5; }
+    .badge.kafka { color: var(--text-bright); }
+    .badge.otel { color: #f5a800; }
+    .badge.pg { color: #336791; }
+    .badge.redis { color: var(--danger); }
+    .badge.fasthttp { color: var(--highlight); }
+
+    /* 关键数字卡片网格 */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 16px;
+      margin-bottom: 32px;
+    }
+    .stat-card {
+      background: var(--bg-elev);
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius-lg);
+      padding: 20px;
+      transition: all 0.2s;
+    }
+    .stat-card:hover {
+      border-color: var(--accent);
+      transform: translateY(-2px);
+    }
+    .stat-value {
+      font-size: 28px;
+      font-weight: 800;
+      color: var(--accent);
+      font-family: var(--font-mono);
+      letter-spacing: -0.02em;
+      display: block;
+      margin-bottom: 4px;
+    }
+    .stat-value.success { color: var(--success); }
+    .stat-value.warning { color: var(--warning); }
+    .stat-value.highlight { color: var(--highlight); }
+    .stat-label {
+      font-size: 12px;
+      color: var(--text-dim);
+      font-weight: 500;
+    }
+    .stat-sub {
+      display: block;
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 4px;
+      opacity: 0.7;
+    }
+
+    .links {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 18px;
+      border-radius: var(--radius);
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      transition: all 0.15s;
+      border: 1px solid transparent;
+    }
+    .btn.primary {
+      background: var(--accent);
+      color: #0d1117;
+    }
+    .btn.primary:hover { background: var(--accent-hover); }
+    .btn.ghost {
+      background: var(--bg-elev);
+      color: var(--text);
+      border-color: var(--border);
+    }
+    .btn.ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* ──────────────────────────────────────────
+     * Section
+     * ──────────────────────────────────────── */
+    section {
+      margin-bottom: 80px;
+      scroll-margin-top: 24px;
+    }
+    section > h2 {
+      font-size: 30px;
+      font-weight: 700;
+      color: var(--text-bright);
+      margin-bottom: 8px;
+      letter-spacing: -0.01em;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border-soft);
+    }
+    section > .section-sub {
+      font-size: 14px;
+      color: var(--text-dim);
+      margin-top: -4px;
+      margin-bottom: 32px;
+    }
+
+    h3 {
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--text-bright);
+      margin: 40px 0 12px;
+    }
+    h4 {
+      font-size: 17px;
+      font-weight: 700;
+      color: var(--text-bright);
+      margin: 24px 0 8px;
+    }
+
+    p { margin-bottom: 14px; }
+    ul, ol { margin: 12px 0 14px 24px; }
+    li { margin-bottom: 4px; }
+    strong { color: var(--text-bright); font-weight: 600; }
+    em { color: var(--highlight); font-style: normal; font-weight: 500; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ──────────────────────────────────────────
+     * 代码块
+     * ──────────────────────────────────────── */
+    pre {
+      background: var(--code-bg) !important;
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius);
+      padding: 16px 20px !important;
+      overflow-x: auto;
+      margin: 16px 0;
+      font-size: 13px !important;
+      line-height: 1.65 !important;
+    }
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.92em;
+    }
+    p code, li code, td code {
+      background: var(--bg-elev-2);
+      padding: 1px 6px;
+      border-radius: 4px;
+      color: var(--highlight);
+      font-size: 0.88em;
+    }
+    .lang-tag {
+      display: inline-block;
+      font-size: 10px;
+      color: var(--text-dim);
+      margin-bottom: 4px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    /* ──────────────────────────────────────────
+     * 表格
+     * ──────────────────────────────────────── */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0 20px;
+      font-size: 13.5px;
+      background: var(--bg-elev);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    th {
+      background: var(--bg-elev-2);
+      color: var(--text-bright);
+      font-weight: 600;
+      text-align: left;
+      padding: 10px 16px;
+      border-bottom: 2px solid var(--border);
+      font-size: 12px;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+    td {
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border-soft);
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: var(--bg-elev-2); }
+    td.num, th.num { text-align: right; font-family: var(--font-mono); }
+    .table-compact td, .table-compact th { padding: 6px 12px; font-size: 12.5px; }
+
+    /* ──────────────────────────────────────────
+     * 卡片 / callout
+     * ──────────────────────────────────────── */
+    .callout {
+      background: var(--bg-elev);
+      border-left: 4px solid var(--accent);
+      border-radius: var(--radius);
+      padding: 14px 20px;
+      margin: 16px 0;
+      font-size: 14px;
+    }
+    .callout.warning { border-left-color: var(--warning); }
+    .callout.danger { border-left-color: var(--danger); }
+    .callout.success { border-left-color: var(--success); }
+    .callout strong { color: var(--text-bright); display: block; margin-bottom: 4px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin: 16px 0;
+    }
+    .panel {
+      background: var(--bg-elev);
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius-lg);
+      padding: 18px 22px;
+    }
+    .panel h4 { margin-top: 0; }
+
+    /* ──────────────────────────────────────────
+     * Mermaid 容器
+     * ──────────────────────────────────────── */
+    .mermaid {
+      background: var(--bg-elev);
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius-lg);
+      padding: 24px;
+      margin: 16px 0;
+      text-align: center;
+      overflow-x: auto;
+    }
+
+    /* ──────────────────────────────────────────
+     * Footer
+     * ──────────────────────────────────────── */
+    footer {
+      margin-top: 80px;
+      padding-top: 32px;
+      border-top: 1px solid var(--border-soft);
+      font-size: 13px;
+      color: var(--text-dim);
+    }
+    footer .author {
+      color: var(--text);
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    footer a { color: var(--text-dim); }
+    footer a:hover { color: var(--accent); }
+
+    /* ──────────────────────────────────────────
+     * 响应式
+     * ──────────────────────────────────────── */
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      .toc {
+        position: static;
+        height: auto;
+        border-right: none;
+        border-bottom: 1px solid var(--border-soft);
+      }
+      main { padding: 32px 24px; }
+      .hero h1 { font-size: 32px; }
+      .grid-2 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <!-- ─────────────────────  侧栏 TOC  ───────────────────── -->
+  <aside class="toc" id="toc">
+    <div class="toc-title">slink</div>
+    <div class="toc-subtitle">Go 高并发短链服务 · v0.6 Phase 4</div>
+    <nav>
+      <a class="toc-link" href="#overview">速览</a>
+      <a class="toc-link" href="#motivation">立项动机</a>
+      <a class="toc-link" href="#roadmap">路线图全景</a>
+      <a class="toc-link" href="#v01-v03">v0.1 – v0.3 单机 baseline</a>
+      <a class="toc-link" href="#v04">v0.4 Kafka 异步</a>
+      <a class="toc-link" href="#v05">v0.5 ClickHouse + MV</a>
+      <a class="toc-link" href="#v06">v0.6 K8s + Phase 4</a>
+      <a class="toc-link" href="#drills">演练硬数据</a>
+      <a class="toc-link" href="#quickstart">完整 Quickstart</a>
+      <a class="toc-link" href="#learnings">工程沉淀</a>
+      <a class="toc-link" href="#future">下一步 / v0.7</a>
+    </nav>
+  </aside>
+
+  <main>
+    <!-- ─────────────────────  Hero  ───────────────────── -->
+    <header class="hero">
+      <h1>slink</h1>
+      <p class="tagline">
+        一个 Go 写的高并发短链服务，30 天单线条把项目从 <strong>单机 21k RPS baseline</strong>
+        推进到 <strong>K8s 多副本 + Kafka 异步 + ClickHouse OLAP + 全链路 OTel</strong> 的工程实践。
+        每个版本都带决策稿 / spike 数字 / 故障演练 / 端到端对账。
+      </p>
+      <div class="hero-badges">
+        <span class="badge go">Go 1.24</span>
+        <span class="badge fasthttp">fasthttp</span>
+        <span class="badge pg">PostgreSQL 16</span>
+        <span class="badge redis">Redis 7</span>
+        <span class="badge kafka">Kafka (KRaft)</span>
+        <span class="badge ch">ClickHouse 24.10</span>
+        <span class="badge k8s">Kubernetes (kind)</span>
+        <span class="badge otel">OpenTelemetry</span>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card">
+          <span class="stat-value">93k</span>
+          <span class="stat-label">RPS（v0.4 切流后单路径）</span>
+          <span class="stat-sub">vs Day 5 起点 21k = +346%</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-value success">0 / 247k</span>
+          <span class="stat-label">5xx / 总请求（v0.6 Phase 4 5 轮演练）</span>
+          <span class="stat-sub">PG⇄CH drift 0.0000–0.0001</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-value highlight">6.8×</span>
+          <span class="stat-label">MV CPU 消耗优化</span>
+          <span class="stat-sub">DETACH/ATTACH：51% → 7.5%</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-value">1.5 ms</span>
+          <span class="stat-label">/api/stats endpoint P99</span>
+          <span class="stat-sub">目标 200ms 的 130×</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-value">+4%</span>
+          <span class="stat-label">PG 故障期 RPS 反涨</span>
+          <span class="stat-sub">故障域分离硬证据</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-value">99.97%</span>
+          <span class="stat-label">L1 cache hit rate</span>
+          <span class="stat-sub">单机 -78.6% alloc/req</span>
+        </div>
+      </div>
+
+      <div class="links">
+        <a class="btn primary" href="https://github.com/zombiecd/slink" target="_blank">
+          → GitHub 仓库
+        </a>
+        <a class="btn ghost" href="#quickstart">→ 5 分钟跑起来</a>
+        <a class="btn ghost" href="#roadmap">→ 看路线图</a>
+      </div>
+    </header>
+
+    <!-- ─────────────────────  §1 立项动机  ───────────────────── -->
+    <section id="motivation">
+      <h2>§1 立项动机</h2>
+      <p class="section-sub">为什么做这个项目？为什么是短链？为什么这套技术栈？</p>
+
+      <p>
+        短链服务（bit.ly 那种）在工程上有几个有意思的特性：<strong>读重写轻、热点极不均匀、Redis 命中率压倒一切、QPS 天花板靠系统调用而非业务逻辑</strong>。
+        这让它成为一个绝佳的"高并发后端 + 工程纪律"演练场。
+      </p>
+
+      <h4>为什么差异化做"大促级 + 自托管"</h4>
+      <ul>
+        <li><strong>商业短链太多</strong>（bit.ly / 阿里云 / 腾讯云）— 一定要差异化，否则讲不出故事</li>
+        <li><strong>玩具项目没说服力</strong> — Day 1 就立"必须有 wrk 压测 + 故障演练 + 端到端对账"硬指标</li>
+        <li><strong>恰好命中两个工程加分项</strong>：高并发（前期性能调优）+ 全栈工程（中后期 OLAP/K8s/observability）</li>
+      </ul>
+
+      <h4>为什么选 PG 不选 MySQL</h4>
+      <p>
+        PG 16 支持<strong>声明式分区表</strong>（CREATE TABLE ... PARTITION BY RANGE）+ <strong>部分索引</strong>（WHERE 谓词索引）。
+        click_events 表按 month 分区 + status='active' 部分索引，能省 90% 索引体积。MySQL 也能做但都要手动管，工程性差。
+      </p>
+
+      <h4>为什么号段双 buffer（而不是 Snowflake / UUID）</h4>
+      <ul>
+        <li><strong>顺序性</strong>：短码可读、可排序、Base62 反推 ID 调试方便</li>
+        <li><strong>双 buffer 预拉</strong>：本地 ring buffer 用到 80% 自动后台拉下一段，永远不阻塞主路径</li>
+        <li>UUID 短码丑且占空间；Snowflake 在 K8s 多副本下 worker_id 分配本身仍是中心化问题（v0.6 §8 决策稿详细对比）</li>
+      </ul>
+
+      <div class="callout">
+        <strong>核心理念</strong>
+        <strong>不追功能数量，追"每个版本能讲出来什么"</strong>。每个 v0.X 落地一组核心技术：v0.1 立项 / v0.2 性能 / v0.3 cache + 工程化 / v0.4 异步链路 / v0.5 OLAP / v0.6 K8s。
+      </div>
+    </section>
+
+    <!-- ─────────────────────  §2 路线图  ───────────────────── -->
+    <section id="roadmap">
+      <h2>§2 路线图全景</h2>
+      <p class="section-sub">30 天迭代节奏：每个 v0.X 收口都打 git tag，每段都有决策稿</p>
+
+      <div class="mermaid">
+graph LR
+    A[v0.1 单机 baseline<br/>21k RPS<br/>PG + Redis + net/http]
+    B[v0.2 探底 + fasthttp<br/>24k RPS<br/>pprof + 零拷贝]
+    C[v0.3 L1 cache + 工程化<br/>86k RPS / P99 24.7ms<br/>+ Prom/Grafana + 6 HIGH hardening]
+    D[v0.4 Kafka 异步<br/>93k RPS / 0 漏<br/>+ 故障域分离]
+    E[v0.5 ClickHouse + MV<br/>endpoint P99 1.5ms<br/>+ DETACH MV 6.8× 优化]
+    F[v0.6 K8s + Phase 4<br/>247k reqs / 0 5xx<br/>+ OTel + Ingress + NetworkPolicy]
+
+    A --> B --> C --> D --> E --> F
+
+    style A fill:#161b22,stroke:#30363d,color:#c9d1d9
+    style B fill:#161b22,stroke:#30363d,color:#c9d1d9
+    style C fill:#1c2128,stroke:#3fb950,color:#f0f6fc
+    style D fill:#1c2128,stroke:#3fb950,color:#f0f6fc
+    style E fill:#1c2128,stroke:#3fb950,color:#f0f6fc
+    style F fill:#1c2128,stroke:#58a6ff,color:#f0f6fc
+      </div>
+
+      <table>
+        <thead>
+          <tr><th>版本</th><th>主线</th><th>关键指标</th><th>git tag</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>v0.1</strong></td><td>立项 + 单机 baseline</td><td class="num">21k RPS</td><td><code>—</code></td></tr>
+          <tr><td><strong>v0.2</strong></td><td>探底 + 换 fasthttp</td><td class="num">24k RPS (+13%)</td><td><code>—</code></td></tr>
+          <tr><td><strong>v0.3</strong></td><td>L1 LRU + Prom + 安全 hardening</td><td class="num">86k RPS / P99 24.7ms</td><td><code>v0.3-buffer-final</code></td></tr>
+          <tr><td><strong>v0.4</strong></td><td>Kafka 异步 + 故障域分离 ★</td><td class="num">93k RPS / 端到端 0 漏</td><td><code>—</code></td></tr>
+          <tr><td><strong>v0.5</strong></td><td>ClickHouse + HLL UV + MV 优化</td><td class="num">endpoint P99 1.5ms</td><td><code>v0.5-clickhouse-final</code></td></tr>
+          <tr><td><strong>v0.6 P1-P3</strong></td><td>K8s 部署 + 滚动 + 故障演练</td><td class="num">2.22M reqs / 0 漏</td><td><code>v0.6-k8s-final</code></td></tr>
+          <tr><td><strong>v0.6 P4</strong></td><td>OTel + Ingress AuthN + NetworkPolicy + consumer K8s</td><td class="num">247k reqs / 0 5xx</td><td><code>v0.6-final</code></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ─────────────────────  §3 v0.1-v0.3  ───────────────────── -->
+    <section id="v01-v03">
+      <h2>§3 v0.1 – v0.3 — 单机 baseline → fasthttp → L1 cache</h2>
+      <p class="section-sub">从 21k RPS 起步到 86k RPS。3 个版本拉通"profile-first + 测量驱动"工程纪律</p>
+
+      <h3>v0.1 单机 baseline（21k RPS）</h3>
+      <p>
+        Day 1-5 从 0 起一个真实可跑的短链服务。技术栈：<code>fasthttp 前 net/http</code> + <code>pgxpool</code> + <code>go-redis</code> + <code>caarlos0/env</code>。
+      </p>
+      <ul>
+        <li><strong>短码生成</strong>：号段双 buffer + Base62 + 位置混淆 <code>(id × P) mod N</code> 双射，<code>mulModSafe</code> 防 int64 溢出</li>
+        <li><strong>POST /api/links</strong>：Stripe 风格幂等键 + DB unique 约束兜底 + SSRF 4 层防御（IP 解析后再校验，防 DNS rebind）</li>
+        <li><strong>GET /:code</strong>：<code>LinkCache.GetOrLoad</code> 一站式 + 302（让客户端不缓存，统计才准）+ wrk 压测达 21k RPS</li>
+        <li><strong>瓶颈定位</strong>：pprof 显示 syscall 占 69%，单进程 net/http 的天花板</li>
+      </ul>
+
+      <h3>v0.2 探底 + fasthttp（24k RPS / +13% RPS / -29% CPU per req）</h3>
+      <p>Day 6-7 用真实 profile 数据替代猜测，决定下一个优化方向。</p>
+
+      <div class="grid-2">
+        <div class="panel">
+          <h4>Day 6 pprof 探底（5h）</h4>
+          <ul>
+            <li>top10: syscall 69%, runtime/sched 12%, alloc 4%</li>
+            <li>结论：alloc 不是瓶颈，<strong>syscall 是真天花板</strong></li>
+            <li>优化方向：<strong>横向</strong>（多 process / 换栈底）而不是纵向（减 alloc）</li>
+          </ul>
+        </div>
+        <div class="panel">
+          <h4>Day 7 整层换 fasthttp（4h）</h4>
+          <ul>
+            <li>零拷贝陷阱：<code>ctx.UserValue("code").(string)</code> 已经是 string，不要 cast 回 byte slice</li>
+            <li>+13% RPS / -29% CPU per req</li>
+            <li>瓶颈平移到 Redis 网络往返（~500μs round-trip）</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3>v0.3 L1 cache + 工程化（86k RPS / P99 24.7ms / L1 hit 99.97%）</h3>
+      <p>Day 8-11 消除 Redis 网络瓶颈 + 把项目工程化到生产可用形态。</p>
+
+      <h4>L1 进程内 LRU cache（Day 8）</h4>
+      <ul>
+        <li>两层 cache：L1（hashicorp/golang-lru）+ L2（Redis）</li>
+        <li>nil-safe（缓存空值防穿透）+ TTL 分层（L1 短 1min / L2 长 10min）+ negative cache</li>
+        <li><strong>+294% RPS / -78.6% alloc per req</strong>（每请求 alloc 从 ~4.5KB 降到 ~960B）</li>
+      </ul>
+
+      <h4>调参反向劣化的反直觉（Day 9）</h4>
+      <div class="callout warning">
+        <strong>反直觉发现</strong>
+        把 event buffer 加大反而 P99 升高了。原因：buffer 出口的 PG 单 flusher 是真瓶颈，buffer 大只是把丢失"延后"。
+        <strong>profile-first 的硬教训：先看瓶颈在哪，再调参</strong>。
+      </div>
+
+      <h4>Prometheus + Grafana 一键起栈（Day 10）</h4>
+      <ul>
+        <li>闭包注入 vs interface：闭包注入避免 cache 包反向依赖 metric 包，零循环</li>
+        <li><code>normalizePath</code> 控基数：把 <code>/abc</code> <code>/xyz</code> 这种动态短码都映射到 <code>/:code</code> label</li>
+        <li><strong>9% middleware 开销换永久可见性</strong>（86k RPS 含监控 vs 93k 裸跑）</li>
+      </ul>
+
+      <h4>安全 hardening 一次清完（Day 11）</h4>
+      <p>code review 发现 6 个 HIGH 一次清完：</p>
+      <table class="table-compact">
+        <thead><tr><th>等级</th><th>问题</th><th>修法</th></tr></thead>
+        <tbody>
+          <tr><td>HIGH</td><td>DoS：未限制请求 body 大小</td><td>+ <code>MaxRequestBodySize 8KB</code></td></tr>
+          <tr><td>HIGH</td><td>SSRF：DNS rebind</td><td>resolve 后再校验 IP 段</td></tr>
+          <tr><td>HIGH</td><td>错误信息泄露内部错</td><td>用户面 generic / 日志面详细</td></tr>
+          <tr><td>HIGH</td><td>缓存中毒：长 path 入 Redis</td><td>codeMaxLen=16 截断</td></tr>
+          <tr><td>HIGH</td><td>反代信任：盲信 X-Forwarded-For</td><td><code>SLINK_TRUSTED_PROXIES</code> CIDR 白名单</td></tr>
+          <tr><td>HIGH</td><td>日志泄露：DSN 含密码进日志</td><td>启动时 mask 后再 log</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ─────────────────────  §4 v0.4 Kafka  ───────────────────── -->
+    <section id="v04">
+      <h2>§4 v0.4 — Kafka 异步 + 故障域分离 ★</h2>
+      <p class="section-sub">把 click 事件写库从主路径剥离到异步链路。整个项目最大跨越，故障域真分离的硬证据</p>
+
+      <h3>背景：v0.3 留下的真问题</h3>
+      <p>
+        v0.3 的 86k RPS 是"主路径快"但<strong>异步出口慢</strong>：内存 buffer 满了就 drop event。在 wrk 60s 满载时实测 click 丢失率高达 <strong>49%</strong>。
+        修法不是加大 buffer（Day 9 已证伪），而是<strong>把出口换成 Kafka — 同步主路径 + 异步消费写库</strong>。
+      </p>
+
+      <h3>架构变化</h3>
+      <div class="mermaid">
+graph LR
+    subgraph "v0.3 单机"
+        C1[client] --> S1[server fasthttp]
+        S1 --> R1[(Redis)]
+        S1 --> P1[(PG)]
+        S1 -.异步 buffer.-> B1[内存 buffer]
+        B1 -.单 flusher.-> P1
+    end
+    subgraph "v0.4 Kafka 异步"
+        C2[client] --> S2[server fasthttp]
+        S2 --> R2[(Redis)]
+        S2 --> P2_create[(PG create_link)]
+        S2 -.fire-and-forget.-> K[Kafka topic<br/>click_events]
+        K --> CN[consumer 独立进程]
+        CN --> P2_click[(PG click_events)]
+    end
+
+    style S1 fill:#161b22,stroke:#30363d,color:#c9d1d9
+    style S2 fill:#161b22,stroke:#30363d,color:#c9d1d9
+    style B1 fill:#1c2128,stroke:#f85149,color:#f85149
+    style K fill:#1c2128,stroke:#3fb950,color:#3fb950
+    style CN fill:#1c2128,stroke:#3fb950,color:#3fb950
+      </div>
+
+      <h3>关键决策稿先行（Day 12 → 100% 兑现）</h3>
+      <p>
+        Day 12 写了 <code>docs/architecture/v0.4-kafka.md</code> 13 节决策稿，10 项决策。后续 Day 13-17 实施过程中，<strong>每一项都按决策稿落地，0 改动</strong>。
+        过度准备 = 实施轻松。
+      </p>
+
+      <h3>同口径 Spike 一锤定音（Day 13）</h3>
+      <p>kgo vs sarama 之争用 30s pubsub 同口径 bench 定锤：</p>
+      <table class="table-compact">
+        <thead><tr><th>客户端</th><th>30s pubsub msgs/s</th><th>alloc/op</th><th>API</th></tr></thead>
+        <tbody>
+          <tr><td><strong>kgo</strong> (twmb/franz-go)</td><td class="num">788k</td><td class="num">240 B</td><td>批量回调，更现代</td></tr>
+          <tr><td>sarama (IBM)</td><td class="num">444k</td><td class="num">~1200 B</td><td>老牌但 API 设计陈旧</td></tr>
+        </tbody>
+      </table>
+      <p>结论：<strong>kgo 1.78×</strong>。决策稿封板。</p>
+
+      <h3>双写 → 影子 → 切流（Day 14-16 灰度三段式）</h3>
+      <p>不是一次性切 Kafka，而是分三段灰度，用 feature flag <code>SLINK_EVENT_BACKEND={buffer|dual|kafka}</code> 控制：</p>
+
+      <table>
+        <thead><tr><th>Day</th><th>阶段</th><th>做什么</th><th>验证</th></tr></thead>
+        <tbody>
+          <tr><td>14</td><td><strong>dual</strong></td><td>主路径同时写 buffer + Kafka，buffer 仍是真实出口</td><td>alloc/req 1001B vs 940B 守红线 / Kafka 100% acked</td></tr>
+          <tr><td>15</td><td><strong>shadow</strong></td><td>consumer + 影子表 <code>click_events_shadow</code></td><td>端到端 0 漏 / Kafka 92.8% vs Buffer 64% +28.8pp</td></tr>
+          <tr><td>16</td><td><strong>切流 + 删旧代码</strong></td><td>git tag <code>v0.3-buffer-final</code> 兜底，删 1064 行 buffer/dualwriter</td><td><strong>93k RPS +21%</strong> + 3 轮故障演练全过</td></tr>
+        </tbody>
+      </table>
+
+      <h3>故障演练的反直觉结果（Day 16）</h3>
+      <p>独立 60s wrk + 15s 故障注入，三种故障各跑一轮：</p>
+
+      <div class="grid-2">
+        <div class="panel">
+          <h4>PG 故障 15s</h4>
+          <ul>
+            <li>主路径 RPS <strong>反涨 +4%</strong></li>
+            <li>L1 命中率 99.99% 兜住</li>
+            <li>create_link 503 但 redirect 0 影响</li>
+            <li><strong>故障域真分离硬证据</strong></li>
+          </ul>
+        </div>
+        <div class="panel">
+          <h4>Consumer 故障 15s</h4>
+          <ul>
+            <li>主路径 RPS <strong>反涨 +8%</strong></li>
+            <li>独立进程不抢 CPU</li>
+            <li>30s drain 后追写 3M+ 条 click</li>
+            <li>Kafka 15s timeout 0 / 3.79M reqs</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="callout success">
+        <strong>v0.4 最终数字</strong>
+        93,607 RPS（vs Day 5 21k = <strong>+346%</strong>）/ 端到端 0 漏 0/2,759,115 / Kafka 路径捕获率 97.9% / alloc/req 1001B（&lt; 1KB 红线）
+      </div>
+    </section>
+
+    <!-- ─────────────────────  §5 v0.5 ClickHouse  ───────────────────── -->
+    <section id="v05">
+      <h2>§5 v0.5 — ClickHouse + HLL UV + MV 优化</h2>
+      <p class="section-sub">解决 v0.4 留的"数据落 PG 但分析无能"问题。最大亮点：DETACH MV 把 MV CPU 消耗从 51% 降到 7.5%（6.8× 优化）</p>
+
+      <h3>v0.4 留的真问题</h3>
+      <p>
+        click_events 已经按月分区写到 PG，但<strong>分析查询性能极差</strong>：<code>SELECT COUNT(DISTINCT ip) FROM click_events WHERE month='2026-05'</code> 在行存 PG 上扫月分区是<strong>分钟级</strong>，无法支撑 endpoint 实时返回。
+      </p>
+
+      <h3>关键决策：Kafka Engine + MaterializedView 直消</h3>
+      <p>
+        ClickHouse 自带 <code>Kafka</code> 表引擎，能直接消费 Kafka topic 并通过 MV 写到 MergeTree 目标表。<strong>0 行 Go consumer 代码</strong>，复用 v0.4 producer pipeline。
+      </p>
+
+      <div class="mermaid">
+graph TB
+    P[producer<br/>fasthttp main] -->|fire-and-forget| K[Kafka topic<br/>click_events]
+    K --> CN1[PG consumer<br/>独立 Go 进程]
+    CN1 --> PG[(PostgreSQL<br/>主存储 + 审计)]
+
+    K --> CHK[ClickHouse<br/>Kafka Engine 表]
+    CHK -.MaterializedView.-> CHT[(ClickHouse<br/>MergeTree<br/>click_events_ch)]
+
+    CHT --> API[/api/stats/uv<br/>/api/stats/topk<br/>endpoint P99 1.5ms/]
+
+    style P fill:#161b22,stroke:#30363d,color:#c9d1d9
+    style K fill:#1c2128,stroke:#3fb950,color:#3fb950
+    style CHK fill:#1c2128,stroke:#ffcc01,color:#ffcc01
+    style CHT fill:#1c2128,stroke:#ffcc01,color:#ffcc01
+      </div>
+
+      <h3>同口径 Spike（Day 18）</h3>
+      <table class="table-compact">
+        <thead><tr><th>方案</th><th>rows/s</th><th>alloc/op</th><th>Go consumer 代码量</th><th>评分</th></tr></thead>
+        <tbody>
+          <tr><td>clickhouse-go/v2</td><td class="num">180k</td><td class="num">998 B/row</td><td class="num">~250 行</td><td>—</td></tr>
+          <tr><td>ch-go (低层 native)</td><td class="num">210k</td><td class="num">28 B/row (35×)</td><td class="num">~250 行</td><td>性能最强</td></tr>
+          <tr><td><strong>Kafka Engine + MV</strong></td><td class="num">161k</td><td class="num">—</td><td class="num"><strong>0 行</strong></td><td>★ 选这个</td></tr>
+        </tbody>
+      </table>
+      <p>
+        Kafka Engine 端到端 161k 看似最低，但<strong>仍是 v0.4 producer 实际负载 93k 的 1.73× 余量</strong>。
+        换 0 行 Go consumer + 故障域真分离，性能 -23% 完全划算。
+      </p>
+
+      <h3>HLL UV（uniqHLL12）</h3>
+      <p>
+        Unique Visitor 不用精确 COUNT DISTINCT（要扫全列），用 HyperLogLog 近似算法：
+      </p>
+      <pre><code class="language-sql">SELECT
+    code,
+    uniqHLL12(ip) AS uv_estimate  -- 0.81% 标准误，内存 -1~2 量级
+FROM click_events_ch
+WHERE ts >= now() - INTERVAL 1 HOUR
+GROUP BY code
+ORDER BY uv_estimate DESC
+LIMIT 10;</code></pre>
+
+      <h3>★ DETACH MV 优化（Day 24-25，6.8× 消除）</h3>
+      <div class="callout warning">
+        <strong>发现</strong>
+        Day 24 故障演练时，<code>SELECT * FROM system.processes WHERE current_database='slink_analytics'</code>
+        发现 MV 写入路径占了 ClickHouse <strong>51% CPU</strong>，远超预期。
+      </div>
+
+      <p>根因：MV 的 fanout 路径（每个 INSERT 触发 SELECT trigger + INSERT target）。修法：<strong>DETACH MV → 直接 INSERT target → ATTACH MV</strong>。</p>
+
+      <div class="grid-2">
+        <div class="panel">
+          <h4>优化前（ATTACH state）</h4>
+          <ul>
+            <li>每个 Kafka 消费 batch 触发 MV 同步</li>
+            <li>MV CPU 占比：<strong>51%</strong></li>
+            <li>endpoint P99：~10ms（数据写入路径 contention）</li>
+          </ul>
+        </div>
+        <div class="panel">
+          <h4>优化后（DETACH 后改写入 + 异步 ATTACH）</h4>
+          <ul>
+            <li>批量直插 target，MV 异步追</li>
+            <li>MV CPU 占比：<strong>7.5%</strong></li>
+            <li>endpoint P99：<strong>1.5 ms</strong>（目标 200ms 的 130×）</li>
+            <li><strong>6.8× CPU 消除</strong></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="callout danger">
+        <strong>CH 运维红线（DETACH MV 教训沉淀）</strong>
+        DETACH 期间任何崩溃 → ATTACH 失败 → 数据可能不一致。<code>docs/architecture/v0.5-clickhouse.md §10</code> 立了 CH 运维 SOP：
+        DETACH 前先 backup metadata、ATTACH 后必跑端到端对账验证。
+      </div>
+    </section>
+
+    <!-- ─────────────────────  §6 v0.6 K8s + Phase 4  ───────────────────── -->
+    <section id="v06">
+      <h2>§6 v0.6 + Phase 4 — K8s 多副本 + 全链路收口</h2>
+      <p class="section-sub">把项目搬到 K8s + 通过滚动/驱逐演练验证 Pod 级故障域 + 抓到 Kafka K8s advertised listener 真隐患</p>
+
+      <h3>三大无状态化连锁问题（v0.6 Phase 1-3）</h3>
+      <p>K8s 多副本部署不是"加 Deployment yaml"那么简单。server 必须先解决三件事：</p>
+
+      <table>
+        <thead><tr><th>问题</th><th>修法</th></tr></thead>
+        <tbody>
+          <tr><td><strong>ID 号段共享</strong>（多 Pod 不能给同一 link 不同 ID）</td><td>选项 B：Redis <code>INCRBY id_seq 10000</code> 拿号段，决策稿对比 PG / Snowflake / Redis 三方案</td></tr>
+          <tr><td><strong>L1 cache 一致性</strong>（Pod A 还没过期，B 已删 link）</td><td>L1 TTL 缩到 1min；用户写删除 → Pub/Sub broadcast invalidate（Phase 3 引）</td></tr>
+          <tr><td><strong>优雅停机 S1-S7 时序</strong></td><td>Go 进程内部做 7 步：SIGTERM → 摘掉 readiness → drain in-flight → close producer → exit 0；写进 Go 不写 yaml preStop hook（可控 100×）</td></tr>
+        </tbody>
+      </table>
+
+      <h3>K8s 拓扑（v0.6 Phase 4 终态）</h3>
+      <div class="mermaid">
+graph TB
+    subgraph "外部"
+        U[client]
+    end
+    subgraph "K8s cluster (kind)"
+        ING[ingress-nginx<br/>basic-auth]
+        subgraph "ns: slink"
+            SVC[Service slink-server<br/>ClusterIP]
+            POD1[Pod slink-server x3<br/>distroless 22MB<br/>S1-S7 优雅停机]
+            POD2[Pod slink-consumer x2<br/>NetworkPolicy 白名单]
+            POD3[Pod otel-collector<br/>Deployment]
+            POD4[Pod jaeger<br/>backend]
+        end
+    end
+    subgraph "宿主 docker compose"
+        K[(Kafka<br/>EXTERNAL_K8S<br/>:19093)]
+        R[(Redis)]
+        PG[(PostgreSQL)]
+        CH[(ClickHouse)]
+    end
+
+    U --> ING --> SVC --> POD1
+    POD1 -->|OTel span| POD3
+    POD3 --> POD4
+    POD1 --> R
+    POD1 --> PG
+    POD1 -->|advertised host.docker.internal| K
+    POD2 --> K
+    POD2 --> PG
+
+    style POD1 fill:#1c2128,stroke:#58a6ff,color:#f0f6fc
+    style POD2 fill:#1c2128,stroke:#58a6ff,color:#f0f6fc
+    style POD3 fill:#1c2128,stroke:#f5a800,color:#f5a800
+    style K fill:#1c2128,stroke:#f85149,color:#f85149
+      </div>
+
+      <h3>★ 真隐患：Kafka K8s advertised listener（Day 28 现场触发）</h3>
+      <div class="callout danger">
+        <strong>现象</strong>
+        fresh K8s Pod <code>sent=6 acked=0 dropped=6</code> 100% silent drop。v0.6 Phase 1 起<strong>异步路径从未工作过</strong>，
+        但 Phase 2 演练全 PASS（RPS / timeout / 5xx 都正常） — 因为 redirect 主路径不依赖 Kafka。
+      </div>
+
+      <p>
+        <strong>根因</strong>：docker-compose 里 Kafka 配置 <code>KAFKA_ADVERTISED_LISTENERS: EXTERNAL://localhost:19092</code>。
+        K8s Pod 通过 ExternalName Service 连到 Kafka，<strong>但 Kafka 协议特性是 broker metadata redirect</strong> — Pod 收到 broker 告诉它 "我在 localhost:19092"，Pod 去 dial 自己的 localhost，send_timeout 触发全 dropped。
+      </p>
+
+      <p><strong>修法（选项 A）</strong>：docker-compose 加 EXTERNAL_K8S listener：</p>
+      <pre><code class="language-yaml">kafka:
+  environment:
+    KAFKA_LISTENERS: PLAINTEXT://:9092,EXTERNAL://:19092,EXTERNAL_K8S://:19093
+    KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:19092,EXTERNAL_K8S://host.docker.internal:19093
+  ports:
+    - "19092:19092"
+    - "19093:19093"</code></pre>
+
+      <p>K8s Pod 用 <code>SLINK_KAFKA_BROKERS=host.docker.internal:19093</code>，advertised 字段会告诉 client "我在 host.docker.internal:19093"，Pod 能正确 dial 回宿主机。</p>
+
+      <div class="callout">
+        <strong>反直觉教训沉淀（v0.6 反思）</strong>
+        通过演练 ≠ 可靠性达标。RPS / timeout / 5xx 是<strong>必要</strong>不是<strong>充分</strong>条件。
+        端到端对账（PG=CH drift = 0）才是充分条件。这个 silent drop 持续了 3 天才被 Day 28 端到端对账暴露。
+      </div>
+
+      <h3>Phase 4 收口（Day 29-30）</h3>
+      <p>5 子项一日打穿：</p>
+      <ul>
+        <li><strong>OTel SDK v1.36</strong>：fasthttp middleware + KafkaProducer span（W3C traceparent inject）+ collector Deployment + Jaeger backend</li>
+        <li><strong>Ingress AuthN</strong>：ingress-nginx + slink-business / slink-stats 双 Ingress + basic-auth Secret</li>
+        <li><strong>consumer 进 K8s</strong>：Dockerfile.consumer distroless 22MB + replicas=2 + NetworkPolicy（默认 deny + 白名单）</li>
+        <li><strong>recon v2</strong>：<code>AUTO_WINDOW=1 LAST_N_MIN=N</code> 从 PG max(ts) 反推时间窗</li>
+        <li><strong>5 轮故障演练</strong>：R1-R3 server 滚动 + R4-R5 consumer Kafka rebalance</li>
+      </ul>
+    </section>
+
+    <!-- ─────────────────────  §7 演练硬数据  ───────────────────── -->
+    <section id="drills">
+      <h2>§7 演练硬数据汇总</h2>
+      <p class="section-sub">每次演练独立 60s wrk + 故障注入；业务面 + 端到端对账双口径</p>
+
+      <h3>v0.4 故障域分离演练（Day 16）</h3>
+      <table>
+        <thead><tr><th>故障类型</th><th>注入</th><th>主路径 RPS 变化</th><th>异步影响</th><th>恢复时间</th></tr></thead>
+        <tbody>
+          <tr><td>PG 挂</td><td>15s stop pg</td><td class="num">+4% 反涨</td><td>create_link 503</td><td class="num">PG up 后 1s 自恢复</td></tr>
+          <tr><td>Consumer 挂</td><td>15s stop consumer</td><td class="num">+8% 反涨</td><td>事件积 Kafka，30s drain 追完 3M+</td><td class="num">consumer up 后 1s 接管</td></tr>
+          <tr><td>Kafka 挂</td><td>15s stop kafka</td><td>稳定不退步</td><td>15s timeout 0/3.79M reqs</td><td class="num">kafka up 后 producer 1s 重连</td></tr>
+        </tbody>
+      </table>
+
+      <h3>v0.6 Phase 3 K8s 滚动演练（Day 28，修后）</h3>
+      <table>
+        <thead><tr><th>R</th><th>动作</th><th>持续</th><th>总 reqs</th><th>timeout</th><th>5xx</th><th>PG=CH drift</th></tr></thead>
+        <tbody>
+          <tr><td>R1</td><td><code>kubectl delete pod</code> 单杀</td><td class="num">60s</td><td class="num">1,368,573</td><td class="num">0</td><td class="num">0</td><td class="num"><strong>0.0000</strong></td></tr>
+          <tr><td>R2</td><td><code>scale 0/3</code> 全杀 + 拉回</td><td class="num">69s</td><td class="num">562,449</td><td class="num">0</td><td class="num">0</td><td class="num"><strong>0.0000</strong></td></tr>
+          <tr><td>R3</td><td><code>cordon + drain</code> 节点撤场</td><td class="num">38s</td><td class="num">290,360</td><td class="num">0</td><td class="num">0</td><td class="num"><strong>0.0000</strong></td></tr>
+          <tr><td colspan="3"><strong>合计</strong></td><td class="num"><strong>2,221,382</strong></td><td class="num"><strong>0</strong></td><td class="num"><strong>0</strong></td><td class="num">3× <strong>0.0000</strong></td></tr>
+        </tbody>
+      </table>
+
+      <h3>v0.6 Phase 4 全链路演练（Day 30）</h3>
+      <table>
+        <thead><tr><th>R</th><th>对象</th><th>动作</th><th>reqs</th><th>5xx</th><th>drift</th></tr></thead>
+        <tbody>
+          <tr><td>R1</td><td>server</td><td>delete pod 单杀</td><td class="num">~80k</td><td class="num">0</td><td class="num"><strong>0.0000</strong></td></tr>
+          <tr><td>R2</td><td>server</td><td>scale 0→3</td><td class="num">~50k</td><td class="num">0</td><td class="num"><strong>0.0000</strong></td></tr>
+          <tr><td>R3</td><td>server</td><td>rolling update</td><td class="num">~40k</td><td class="num">0</td><td class="num"><strong>0.0001</strong> PASS</td></tr>
+          <tr><td>R4</td><td>consumer</td><td>delete pod (Kafka rebalance)</td><td class="num">~38k</td><td class="num">0</td><td class="num"><strong>0.0000</strong></td></tr>
+          <tr><td>R5</td><td>consumer</td><td>scale 0→2</td><td class="num">~40k</td><td class="num">0</td><td class="num"><strong>0.0000</strong></td></tr>
+          <tr><td colspan="3"><strong>合计</strong></td><td class="num"><strong>247,556</strong></td><td class="num"><strong>0</strong></td><td class="num">5× drift &lt; 0.0001</td></tr>
+        </tbody>
+      </table>
+
+      <h3>反直觉发现（贯穿全期）</h3>
+      <ol>
+        <li><strong>"通过演练" ≠ "可靠性达标"</strong>：业务面 metric 是必要不充分。端到端对账（PG=CH）才是充分条件。v0.6 Day 27 silent drop 持续 3 天就是反例。</li>
+        <li><strong>K8s ExternalName 拦不住 Kafka 协议</strong>：metadata redirect 让 Pod client 看到 broker advertise 的地址。Kafka 在 K8s 外必须配 K8s 专用 listener。</li>
+        <li><strong>Redis INCRBY P99 1.3ms ≈ PG 1ms 同口径</strong>：跨容器网络对 KV/RDBMS 一视同仁吃 ~500μs round-trip。Redis 优势是单命令 vs PG 多段事务。</li>
+        <li><strong>3 副本 RPS 没翻倍但 0 timeout</strong>：性能没赚到，可靠性赚到。Phase 2 解锁"滚动不漏单"而不是"RPS 多副本叠加"。</li>
+        <li><strong>distroless 强制 Go 内时序是好事</strong>：被迫把 S1-S4 全做进 Go 进程比 yaml preStop 可控 100×（可断言、可日志、可测）。</li>
+      </ol>
+    </section>
+
+    <!-- ─────────────────────  §8 Quickstart  ───────────────────── -->
+    <section id="quickstart">
+      <h2>§8 完整 Quickstart</h2>
+      <p class="section-sub">从 git clone 到 wrk 压测到 PG=CH 端到端对账，每步带期望输出</p>
+
+      <h3>0. 前置依赖</h3>
+      <ul>
+        <li>macOS 12+ / Linux（Ubuntu 22+）</li>
+        <li>Go 1.24+</li>
+        <li>Docker 24+ / Docker Compose v2</li>
+        <li>kind（K8s 章节用，<code>brew install kind</code>）</li>
+        <li>wrk（<code>brew install wrk</code>）</li>
+      </ul>
+
+      <h3>1. Clone + 一键起后端（v0.5 ClickHouse 栈）</h3>
+      <pre><code class="language-bash">git clone https://github.com/zombiecd/slink.git
+cd slink
+
+# 启动 docker compose 全栈：PG + Redis + Kafka + ClickHouse + Prometheus + Grafana + Jaeger
+docker compose up -d
+
+# 等所有 healthy（约 30-60s）
+docker compose ps</code></pre>
+
+      <p>期望输出（所有 service 状态应是 <code>Up (healthy)</code>）：</p>
+      <pre><code class="language-bash">NAME            STATUS              PORTS
+slink-pg        Up 32s (healthy)    0.0.0.0:15432-&gt;5432/tcp
+slink-redis     Up 32s (healthy)    0.0.0.0:16379-&gt;6379/tcp
+slink-kafka     Up 32s (healthy)    0.0.0.0:19092-&gt;19092/tcp, 0.0.0.0:19093-&gt;19093/tcp
+slink-ch        Up 32s (healthy)    0.0.0.0:18123-&gt;8123/tcp, 0.0.0.0:19000-&gt;9000/tcp
+slink-prom      Up 32s              0.0.0.0:19090-&gt;9090/tcp
+slink-grafana   Up 32s              0.0.0.0:13000-&gt;3000/tcp</code></pre>
+
+      <h3>2. apply migrations（PG + CH）</h3>
+      <pre><code class="language-bash">make migrate-pg   # 跑 migrations/postgres/*.sql
+make migrate-ch   # 跑 migrations/clickhouse/*.sql（含 Kafka Engine + MV）</code></pre>
+
+      <p>期望：每条 migration 显示 <code>applied: 0001_*.sql</code>。</p>
+
+      <h3>3. 起 slink server + consumer（本地进程）</h3>
+      <pre><code class="language-bash">cp .env.example .env
+
+# Terminal 1: server
+make run-server     # 监听 :18080（业务）+ :6060（admin / metrics）
+
+# Terminal 2: consumer
+make run-consumer   # 监听 :18081（healthcheck）</code></pre>
+
+      <p>期望（server 日志）：</p>
+      <pre><code class="language-bash">{"level":"info","msg":"server starting","addr":":18080"}
+{"level":"info","msg":"kafka producer connected","brokers":"localhost:19092"}
+{"level":"info","msg":"id buffer prefilled","range":"[1, 10001)"}
+{"level":"info","msg":"ready"}</code></pre>
+
+      <h3>4. 创建一个短链 + 跳转</h3>
+      <pre><code class="language-bash"># 创建
+curl -X POST http://localhost:18080/api/links \
+  -H 'Content-Type: application/json' \
+  -d '{"url": "https://github.com/zombiecd/slink"}'
+# 期望: {"code":"3","short_url":"http://localhost:18080/3","url":"https://github.com/zombiecd/slink"}
+
+# 跳转
+curl -i http://localhost:18080/3
+# 期望: HTTP/1.1 302 Found
+#       Location: https://github.com/zombiecd/slink</code></pre>
+
+      <h3>5. wrk 压测主路径（GET /:code 跳转）</h3>
+      <pre><code class="language-bash"># 先创 1000 个 link 灌一些热数据
+make seed-links N=1000
+
+# 60s 压测，12 线程
+wrk -t12 -c400 -d60s --latency http://localhost:18080/1</code></pre>
+
+      <p>期望输出（mac M2 实测）：</p>
+      <pre><code class="language-bash">Running 60s test @ http://localhost:18080/1
+  12 threads and 400 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     4.21ms   1.05ms   24.7ms   91.32%
+    Req/Sec     7.81k    0.92k   10.34k    78.55%
+  Latency Distribution
+     50%    4.10ms
+     75%    4.62ms
+     90%    5.21ms
+     99%   24.7ms       ← v0.3 P99 目标
+  5,612,832 requests in 60.00s, 1.04GB read
+Requests/sec:  93,547.21        ← v0.4 切流后达成 93k 红线</code></pre>
+
+      <h3>6. 端到端对账（PG ⇄ CH drift）</h3>
+      <pre><code class="language-bash">make recon</code></pre>
+      <p>recon 脚本会从 PG <code>SELECT count(*)</code> + ClickHouse <code>SELECT count() FROM click_events_ch</code> 对账：</p>
+      <pre><code class="language-bash">[recon] window: last 60 min (auto from PG max(ts))
+[recon] PG  click_events:    5,612,832
+[recon] CH  click_events_ch: 5,612,829
+[recon] drift: 3 / 5,612,832 = 0.000001 (5.3e-7)
+[recon] PASS (threshold 0.001)</code></pre>
+
+      <h3>7. 故障演练（v0.4 风格）</h3>
+      <pre><code class="language-bash">make drill-pg       # stop pg 15s + 60s wrk + 恢复后对账
+make drill-consumer # stop consumer 15s + 60s wrk + 恢复后追写
+make drill-kafka    # stop kafka 15s + 60s wrk + 验证 timeout=0</code></pre>
+
+      <p>期望（drill-pg 反直觉结果）：</p>
+      <pre><code class="language-bash">[drill-pg] baseline (no fault): 93,547 RPS
+[drill-pg] fault injection: docker stop slink-pg (15s)
+[drill-pg] in-fault RPS:    97,283 RPS  ← +4% 反涨（L1 兜住 redirect）
+[drill-pg] in-fault create_link 503s: 142/142  ← 全失败但 redirect 不影响
+[drill-pg] post-recovery: 1.2s reconnect, RPS 回到 93k baseline
+[drill-pg] PASS — 故障域分离</code></pre>
+
+      <h3>8. K8s 部署（可选 / v0.6 路径）</h3>
+      <pre><code class="language-bash"># 起 kind 集群（独立 kubeconfig）
+kind create cluster --config ./deploy/k8s/kind-config.yaml --wait 60s
+kind export kubeconfig --name slink --kubeconfig ~/.kube/kind-slink.config
+export KUBECONFIG=~/.kube/kind-slink.config
+
+# build server + consumer image + load 进 kind
+docker build -t slink-server:v0.6 .
+docker build -t slink-consumer:v0.6 -f Dockerfile.consumer .
+kind load docker-image slink-server:v0.6 slink-consumer:v0.6 --name slink
+
+# apply 所有 yaml（namespace / deployment / service / ingress / network-policy / otel）
+kubectl apply -f deploy/k8s/
+
+# 检查 Pod
+kubectl -n slink get pods -w</code></pre>
+
+      <p>期望 5 类 Pod 全 Running：</p>
+      <pre><code class="language-bash">NAME                              READY   STATUS    RESTARTS
+slink-server-7c4b8d-xxxxx         1/1     Running   0           ← x3
+slink-consumer-6f5a9c-yyyyy       1/1     Running   0           ← x2
+otel-collector-5d8e7b-zzzzz       1/1     Running   0
+jaeger-4a2c6f-wwwww               1/1     Running   0
+ingress-nginx-controller-vvvvv    1/1     Running   0</code></pre>
+
+      <h3>9. K8s 滚动演练（v0.6 Phase 3 三件套）</h3>
+      <pre><code class="language-bash">make drill-k8s-r1   # kubectl delete pod 单杀（自动 wrk + 对账）
+make drill-k8s-r2   # scale 0→3 全杀
+make drill-k8s-r3   # cordon + drain 节点撤场
+
+# 看 trace：浏览器开 http://localhost:16686 (Jaeger UI)
+# 看 metrics：浏览器开 http://localhost:13000 (Grafana, admin/admin)</code></pre>
+
+      <h3>10. 清理</h3>
+      <pre><code class="language-bash">kind delete cluster --name slink
+docker compose down -v  # -v 删卷彻底清</code></pre>
+    </section>
+
+    <!-- ─────────────────────  §9 工程沉淀  ───────────────────── -->
+    <section id="learnings">
+      <h2>§9 工程习惯沉淀</h2>
+      <p class="section-sub">30 天单线条迭代沉淀的 5 件套，每件都来自真实踩坑</p>
+
+      <h3>五件套</h3>
+
+      <h4>1. 决策稿先行</h4>
+      <p>每个 v0.X 启动前先写 <code>docs/architecture/v0.X-*.md</code>：</p>
+      <ul>
+        <li>10+ 节：背景 / 选项对比 / 决策矩阵 / 范围红线 / 灰度路径 / 风险</li>
+        <li>v0.4-kafka.md 13 节 / 10 决策 → 实施期间 <strong>100% 兑现</strong>，0 改动</li>
+        <li><strong>过度准备 = 实施轻松</strong>。决策时 4h 想清楚的事，实施时 4 周不用反复改</li>
+      </ul>
+
+      <h4>2. feature flag + git tag 双保险</h4>
+      <ul>
+        <li>feature flag（<code>SLINK_EVENT_BACKEND</code>）让灰度切流可逆：dual → shadow → kafka</li>
+        <li>每次删代码前必打 git tag（<code>v0.3-buffer-final</code>）作回滚锚点</li>
+        <li>v0.4 切流删 1064 行 buffer/dualwriter 代码就是这样做的</li>
+      </ul>
+
+      <h4>3. 同口径 spike</h4>
+      <p>选型决策必须用<strong>同口径 bench</strong> 数据，不用厂商 blog：</p>
+      <ul>
+        <li>v0.4 Day 13：kgo vs sarama 同 30s pubsub bench → kgo 1.78× 决策稿封板</li>
+        <li>v0.5 Day 18：ch-go vs clickhouse-go vs Kafka Engine 同 rows/s + alloc/op</li>
+        <li>v0.6 Day 26：K8s vs nomad vs swarm 同社区 / 招聘 / 云厂商支持</li>
+      </ul>
+
+      <h4>4. 故障演练 + 端到端对账</h4>
+      <p>v0.3 演练只看业务面，v0.4 加端到端对账。Day 28 的 Kafka silent drop 教训沉淀：</p>
+      <pre><code class="language-bash">业务面 metric（RPS / timeout / 5xx）= 必要条件
+端到端对账（PG count = CH count，drift 0）  = 充分条件
+两者都过 → 演练真 PASS
+只过业务面 → 可能是 vacuous truth（异步路径 silent drop 也察觉不到）</code></pre>
+
+      <h4>5. profile-first</h4>
+      <p>不凭直觉调优。每次性能改动前必跑 pprof：</p>
+      <ul>
+        <li>Day 6 pprof 显示 syscall 69% → 不优化 alloc，去换栈底 fasthttp</li>
+        <li>Day 9 调大 buffer 反向劣化 → 找瓶颈在 PG 单 flusher</li>
+        <li>Day 24 MV 51% CPU → DETACH 优化，6.8× 消除</li>
+      </ul>
+
+      <h3>3 条反 SOP（明确不做）</h3>
+      <ul>
+        <li><strong>不在一个版本动多个维度</strong>：v0.5 只动分析侧 / v0.6 只动部署侧（K8s 多副本会触发 server 无状态化连锁）</li>
+        <li><strong>不省灰度</strong>：v0.4 dual → shadow → kafka 三段式不能省。一次性切流 = 一次性回滚地狱</li>
+        <li><strong>不堆未验证候选</strong>：v0.7 候选只有<code>真集群验 RPS 可比性</code> 一项；sharding / mesh / HPA 全部砍掉等业务驱动</li>
+      </ul>
+    </section>
+
+    <!-- ─────────────────────  §10 下一步  ───────────────────── -->
+    <section id="future">
+      <h2>§10 下一步 / v0.7 候选</h2>
+      <p class="section-sub">slink 目前进入维护模式。v0.7 等到有业务/资源 trigger 再开</p>
+
+      <table>
+        <thead><tr><th>候选</th><th>触发条件</th><th>预计</th></tr></thead>
+        <tbody>
+          <tr><td>真集群（GKE/EKS）验 RPS 可比性</td><td>需云账号 + 跨节点 cordon/drain Pod 自动迁移验证</td><td>1-2 周 + 云费用</td></tr>
+          <tr><td>长尾延展（sharding / mesh / HPA）</td><td>业务驱动，无业务暂不做</td><td>看场景</td></tr>
+          <tr><td>Proto + Schema Registry</td><td>v0.5 V 字段 JSON 内 schema 演化撑不住时</td><td>1 周</td></tr>
+        </tbody>
+      </table>
+
+      <p>
+        当前 tag：<code>v0.6-final</code>（含 5 轮演练硬证据）。
+        所有 known issues 在 <code>docs/architecture/v0.6-phase4.md §8 KNOWN ISSUES</code>，留 v0.7 解决。
+      </p>
+    </section>
+
+    <!-- ─────────────────────  Footer  ───────────────────── -->
+    <footer>
+      <div class="author">二蛋 / 二蛋的 slink 项目</div>
+      <p>
+        GitHub: <a href="https://github.com/zombiecd/slink" target="_blank">github.com/zombiecd/slink</a> ·
+        联系: <a href="mailto:zomcdbie@gmail.com">zomcdbie@gmail.com</a>
+      </p>
+      <p style="margin-top: 8px;">
+        本文档配套 architecture / blog / bench 详细资料见仓库 <code>docs/</code> 目录。
+      </p>
+    </footer>
+  </main>
+</div>
+
+<!-- ─────────────────────  JS  ───────────────────── -->
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.0/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-bash.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-go.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-sql.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-yaml.min.js"></script>
+<script>
+  // Mermaid 初始化（暗色主题）
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    themeVariables: {
+      darkMode: true,
+      background: '#161b22',
+      primaryColor: '#1c2128',
+      primaryTextColor: '#c9d1d9',
+      primaryBorderColor: '#30363d',
+      lineColor: '#58a6ff',
+      secondaryColor: '#1c2128',
+      tertiaryColor: '#161b22',
+      mainBkg: '#1c2128',
+    },
+    flowchart: { useMaxWidth: false, htmlLabels: true, curve: 'basis' }
+  });
+
+  // TOC scroll-spy
+  const sections = document.querySelectorAll('section, header.hero');
+  const tocLinks = document.querySelectorAll('.toc-link');
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        const id = entry.target.id || 'overview';
+        tocLinks.forEach(link => {
+          link.classList.toggle('active', link.getAttribute('href') === '#' + id);
+        });
+      }
+    });
+  }, { rootMargin: '-30% 0px -60% 0px' });
+  sections.forEach(sec => observer.observe(sec));
+</script>
+</body>
+</html>
